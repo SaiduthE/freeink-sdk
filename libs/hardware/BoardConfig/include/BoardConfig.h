@@ -1319,32 +1319,40 @@ constexpr BoardProfile M5PAPER_V11 = {
     // via holdPowerRails() or the board powers off when USB is unplugged.
     {2}};
 
-// --- e-Minimal 7.8" (ED052TC4-class glass behind IT8951E) — ESP32-S3 N16R8 -----
+// --- e-Minimal 7.8" (Waveshare 7.8inch e-Paper HAT, IT8951E) — ESP32-S3 N16R8 --
 // A DIY 7.8" reader: ESP32-S3-WROOM-1 N16R8 (16MB flash, 8MB octal PSRAM) driving
-// a 1872x1404 16-grey panel through an IT8951E timing controller, four buttons,
-// no touch, microSD on 1-bit SDMMC.
+// a Waveshare 1872x1404 16-grey HAT through its IT8951E timing controller, four
+// buttons, no touch, microSD on 1-bit SDMMC.
 //
-// FIRST S3 TARGET ON THE IT8951 DRIVER. Every other S3 board here drives its
-// panel directly (LovyanGFX parallel, or a UC8xxx/SSD SPI controller); only
-// M5Paper v1.1 — classic ESP32 — uses It8951Driver. Two consequences worth
-// knowing before debugging this board:
+// The panel vendor is irrelevant to this driver: It8951Driver speaks the
+// controller's protocol, and geometry comes from GET_DEV_INFO rather than a
+// constant. What differs between IT8951 boards is wiring and per-panel values,
+// and all of it is already injectable through It8951Config
+// (-DFREEINK_IT8951_CONFIG) without touching the driver:
 //
-//   1. The driver's header says its body uses VSPI and other classic-ESP32-only
-//      symbols. Reading the source, it uses plain Arduino SPIClass throughout
-//      (beginTransaction / transfer16 / writeBytes), so the comment looks stale.
-//      If an S3 build fails, that comment is the first thing to re-check.
-//   2. DisplayPins has no MISO field: M5Paper shares one SPI bus with its SD
-//      card and the driver picks up MISO from the SD wiring via the Arduino SPI
-//      global. WE DO NOT SHARE — the card is on SDMMC, so nothing initialises a
-//      MISO for the panel. The IT8951 needs MISO for GET_DEV_INFO and register
-//      reads, so this is a real porting task, not a configuration value. Until
-//      it is done the panel can be written to but not interrogated.
+//   miso     This board does NOT share a bus with the SD card the way M5Paper
+//            does -- the card is on SDMMC -- so it supplies its own MISO. The
+//            IT8951 needs it for GET_DEV_INFO and register reads.
+//   vcomMv   Waveshare ships VCOM per panel, printed on the FPC. 0 keeps the
+//            factory OTP value; set the measured one once it is read off the
+//            flex at G1. Copying another panel's VCOM is a known way to get
+//            poor contrast or damage.
+//   rotation IT8951_ROTATE_AUTO picks 0/90 from the reported orientation, which
+//            is what lands a landscape framebuffer upright on a portrait read.
+//
+// FIRST S3 TARGET ON THIS DRIVER. Every other S3 board here drives its panel
+// directly; only M5Paper v1.1, a classic ESP32, has used It8951Driver. The
+// driver's header warns its body uses VSPI and other classic-ESP32-only
+// symbols, but the source is plain Arduino SPIClass throughout
+// (beginTransaction / transfer16 / writeBytes), so that comment looks stale. If
+// an S3 build breaks here, re-check it first.
 //
 // PINS ARE PROVISIONAL. The panel is not on the bench; these reserve the block
 // board_config.h holds clear and use GPIO 38-40, recovered once the board was
 // confirmed to have no onboard SD slot. Confirm at G0/G2 against real wiring
 // before trusting them. GPIO 33-37 are octal PSRAM on an N16R8 and must stay
-// clear; they are free on an N8 part, which is why generic S3 pinouts suggest them.
+// clear -- they are free on an N8 part, which is why generic S3 pinouts
+// recommend them.
 constexpr BoardProfile EMINIMAL_78 = {
     Board::EMinimal78,
     "eminimal_78",
