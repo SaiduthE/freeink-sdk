@@ -42,10 +42,19 @@ class It8951Driver : public PanelDriver {
   // Strip support is advertised so the consumer keeps the B/W frame intact and
   // hands displayGray() the true base buffer (the no-strip fallback overwrites the
   // framebuffer with the MSB plane, which would paint a near-black, inverted page).
+  //
+  // Combined base: the controller takes a whole 4bpp frame per load, so the B/W
+  // base and the gray planes go up together in ONE load and ONE refresh.
+  // Advertising a Separate base made the host display() the B/W page first and
+  // then re-load and re-refresh the whole panel for the AA edges -- two 1.3 MB
+  // loads and two waveforms per page turn, seen as a second "flash" ~1.5 s after
+  // the text appeared. displayGrayscaleBase() now only stages the base;
+  // displayGray() commits it.
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const override {
     if (mode != GrayscaleMode::Overlay) return {};
-    return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, true, false, false};
+    return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Combined, true, false, false};
   }
+  void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
   void writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const uint8_t* rows, uint16_t yStart,
@@ -73,6 +82,10 @@ class It8951Driver : public PanelDriver {
   void loadImageGray(const uint8_t* base);  // combine base + LSB/MSB planes -> 4bpp into controller SRAM
   void displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode);
   void waitDisplayReady();                // poll LUT-busy register
+  // Pick the waveform for a refresh the host asked for in `mode`: a clearing
+  // GC16 for Full/Half, the first paint, a wake, or the periodic ghost-clear;
+  // otherwise `differential` (DU for B/W, DU4 for gray). Updates the counters.
+  uint16_t resolveMode(RefreshMode mode, uint16_t differential);
 
   const It8951Config& _cfg;
   // Reference to the Arduino global SPI bus (VSPI on ESP32) — the SAME object the
@@ -114,11 +127,18 @@ class It8951Driver : public PanelDriver {
   // LD_IMG_AREA header still promised the full width, scrambling the image.
   uint8_t* _rowBuf = nullptr;
 
-  // Snapshot of the last B/W frame from display(). The consumer's strip-grayscale
-  // pass clears the live framebuffer to 0x00 while rendering the planes to a
-  // scratch buffer, so by displayGray() the passed buffer is black — we use this
-  // snapshot (captured before the clear) as the true base instead.
+  // Snapshot of the last B/W frame from display() or displayGrayscaleBase(). The
+  // consumer's strip-grayscale pass clears the live framebuffer to 0x00 while
+  // rendering the planes to a scratch buffer, so by displayGray() the passed
+  // buffer is black — we use this snapshot (captured before the clear) as the
+  // true base instead.
   uint8_t* _base = nullptr;
+  // A base staged by displayGrayscaleBase() and not yet on the glass. displayGray()
+  // commits it with the mode the host asked for; cleanupGrayscaleBuffers() flushes
+  // it as plain B/W if the gray pass never arrived, so a page is never lost.
+  bool _baseStaged = false;
+  RefreshMode _stagedMode = RefreshMode::Fast;
+  bool _stagedTurnOff = false;
 };
 
 PanelDriver& it8951Driver();
