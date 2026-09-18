@@ -16,33 +16,12 @@
 //
 // Selection: linked only when -DFREEINK_DRIVER_IT8951 (M5Paper env).
 
+#include <It8951Config.h>
 #include <SPI.h>
 
 #include "PanelDriver.h"
 
 namespace freeink {
-
-// cfg.rotation sentinel: pick 0° or 90° at begin() from the panel's reported
-// orientation so the landscape framebuffer lands upright on the portrait panel.
-constexpr uint16_t IT8951_ROTATE_AUTO = 0xFF;
-
-struct It8951Config {
-  int8_t miso;        // SPI MISO (IT8951 register / device-info reads)
-  uint32_t spiHz;     // SPI clock
-  uint16_t rotation;  // LD_IMG rotation 0/1/2/3 = 0/90/180/270°, or IT8951_ROTATE_AUTO
-  uint16_t vcomMv;    // VCOM magnitude in mV (e.g. 2300 = -2.30 V); 0 = keep panel OTP
-  uint8_t fullMode;   // clearing refresh (GC16 = 2). Used for Full/Half, wake from
-                      // standby, and the periodic ghost-clear below.
-  uint8_t fastMode;   // B/W page turns (DU = 1, 2-level differential).
-  uint8_t grayMode;   // anti-aliased grayscale pages. DU4 (6) is a 4-level DIRECT
-                      // update: differential, so only changed pixels (the AA glyph
-                      // edges) move — no flash. GC16 (2) would drive every pixel.
-  uint16_t ghostClearInterval;  // promote a differential (DU/DU4) refresh to a GC16
-                                // ghost-clear every N partials (0 = never). Keeps
-                                // DU/DU4 residue from accumulating across menu and
-                                // activity navigation, with no firmware involvement.
-  uint32_t imgBufFallbackAddr;  // used only if GET_DEV_INFO returns no buffer address
-};
 
 const It8951Config& it8951DefaultConfig();
 
@@ -128,6 +107,12 @@ class It8951Driver : public PanelDriver {
   // in displayGray(). Allocated in begin().
   uint8_t* _gLsb = nullptr;
   uint8_t* _gMsb = nullptr;
+
+  // One 4bpp output row (_fbW / 2 bytes) for the load loops. Allocated in
+  // begin() from the profile width, so any IT8951 panel geometry streams whole
+  // rows — a fixed 960-px buffer would have truncated wider panels while the
+  // LD_IMG_AREA header still promised the full width, scrambling the image.
+  uint8_t* _rowBuf = nullptr;
 
   // Snapshot of the last B/W frame from display(). The consumer's strip-grayscale
   // pass clears the live framebuffer to 0x00 while rendering the planes to a
