@@ -323,9 +323,11 @@
 // internal DRAM but 8MB PSRAM, and the 63KB 540x960 framebuffer does not fit in
 // .bss alongside the firmware. Every other device keeps the static DRAM array.
 // (The prebuilt Arduino-ESP32 libs disable BSS-in-PSRAM, so this is a runtime
-// heap allocation, not EXT_RAM_BSS_ATTR.)
+// heap allocation, not EXT_RAM_BSS_ATTR.) e-Minimal 7.8" joins them: its
+// 1872x1404 framebuffer is 329KB, more than the S3's whole internal heap, and
+// the facade keeps two of them.
 #ifndef FREEINK_FB_PSRAM
-#define FREEINK_FB_PSRAM (FREEINK_DEVICE_M5PAPER || FREEINK_DEVICE_PAPERMONO)
+#define FREEINK_FB_PSRAM (FREEINK_DEVICE_M5PAPER || FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_EMINIMAL)
 #endif
 
 // SD transport. de-link (4-bit) and X4 Pro (1-bit) are wired for SDMMC; SdFat
@@ -1310,28 +1312,32 @@ constexpr BoardProfile M5PAPER_V11 = {
 // (-DFREEINK_IT8951_CONFIG) without touching the driver:
 //
 //   miso     This board does NOT share a bus with the SD card the way M5Paper
-//            does -- the card is on SDMMC -- so it supplies its own MISO. The
-//            IT8951 needs it for GET_DEV_INFO and register reads.
-//   vcomMv   Waveshare ships VCOM per panel, printed on the FPC. 0 keeps the
-//            factory OTP value; set the measured one once it is read off the
-//            flex at G1. Copying another panel's VCOM is a known way to get
-//            poor contrast or damage.
+//            does -- the card is on SDMMC -- so it supplies its own MISO (17).
+//            The IT8951 needs it for GET_DEV_INFO and register reads.
+//   vcomMv   Waveshare ships VCOM per panel, printed on the FPC: -1.92 V on
+//            this one, while the controller arrived set to -2.50 V and ghosted.
+//            Copying another panel's VCOM is a known way to get poor contrast
+//            or damage. An SPI-set VCOM does not survive a reset either, so the
+//            driver writes it on every begin().
 //   rotation IT8951_ROTATE_AUTO picks 0/90 from the reported orientation, which
 //            is what lands a landscape framebuffer upright on a portrait read.
+//   modes    The mode numbers belong to the panel's LUT. This one reports
+//            "M841": A2 is 6 and DU4 is 7, the reverse of M5Paper's LUT.
+//
+// The values live in libs/hardware/BoardEMinimal78 (eminimal78It8951Config),
+// which It8951Driver.cpp selects for this device unless the build injects
+// -DFREEINK_IT8951_CONFIG. Add that library to lib_deps.
 //
 // FIRST S3 TARGET ON THIS DRIVER. Every other S3 board here drives its panel
-// directly; only M5Paper v1.1, a classic ESP32, has used It8951Driver. The
-// driver's header warns its body uses VSPI and other classic-ESP32-only
-// symbols, but the source is plain Arduino SPIClass throughout
-// (beginTransaction / transfer16 / writeBytes), so that comment looks stale. If
-// an S3 build breaks here, re-check it first.
+// directly; only M5Paper v1.1, a classic ESP32, had used It8951Driver. The
+// driver body is plain Arduino SPIClass (beginTransaction / transfer16 /
+// writeBytes) and needed no MCU-specific change.
 //
-// PINS ARE PROVISIONAL. The panel is not on the bench; these reserve the block
-// board_config.h holds clear and use GPIO 38-40, recovered once the board was
-// confirmed to have no onboard SD slot. Confirm at G0/G2 against real wiring
-// before trusting them. GPIO 33-37 are octal PSRAM on an N16R8 and must stay
-// clear -- they are free on an N8 part, which is why generic S3 pinouts
-// recommend them.
+// PINS CONFIRMED ON THE BENCH (G2, 2026-09-18): GET_DEV_INFO reads 1872x1404,
+// full frames load and every waveform mode refreshes the glass on this wiring
+// at 10 MHz (13.3 clean too; 16 marginal on jumpers; 20 corrupts long reads).
+// GPIO 33-37 are octal PSRAM on an N16R8 and must stay clear -- they are free
+// on an N8 part, which is why generic S3 pinouts recommend them.
 constexpr BoardProfile EMINIMAL_78 = {
     Board::EMinimal78,
     "eminimal_78",
@@ -1343,10 +1349,16 @@ constexpr BoardProfile EMINIMAL_78 = {
     // No DC: the IT8951's 16-bit preamble carries the command/data distinction.
     // No RST: M5Paper leaves it unassigned too; wire it only if hard recovery needs it.
     {14, 16, 18, PIN_UNASSIGNED, PIN_UNASSIGNED, 38, 39},
-    0,  // displaySpiHz: 0 -> the driver's 10 MHz default. Sweep at G2 rather than pick.
-    // SdPins unused — the card is on SDMMC below. Kept fully unassigned so a
-    // stray SPI mount cannot half-work and confuse the diagnosis.
-    {PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, false, 0},
+    0,  // displaySpiHz: unused by It8951Driver, which owns its SPI and takes the
+        // clock from It8951Config.spiHz (10 MHz, swept at G2).
+    // SdPins bus entries unused — the card is on SDMMC below; kept unassigned so
+    // a stray SPI mount cannot half-work and confuse the diagnosis. The entry is
+    // retained for powerEnable=GPIO21, which the SDMMC mount path drives: a PNP
+    // high-side switch on the card's 3V3 (base LOW = on, 10k base pull-up holds
+    // the card OFF while the pin floats at boot). Trailing false = active-LOW,
+    // so SdmmcBlockDevice's HIGH->LOW pulse is a power-cycle then power-on, and
+    // the sleep path parks it HIGH to cut the rail.
+    {PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 21, false, 0, false},
     // back, confirm, left, right, up, down, power, powerActiveHigh.
     // Four buttons, active-low with internal pull-ups. Left/right unassigned:
     // the spec's controls are Prev/Next/Select/Back-Sleep, mapped up/down/confirm/back.
@@ -1911,7 +1923,8 @@ constexpr uint32_t MAX_FRAMEBUFFER_BYTES = cmax(
                         FREEINK_DEVICE_MURPHY_M4 ? panelBytes(MURPHY_M4) : 0u),
                    cmax(cmax(FREEINK_DEVICE_EEGO_A4 ? panelBytes(EEGO_A4) : 0u,
                              FREEINK_DEVICE_ONEPAGE ? panelBytes(ONEPAGE) : 0u),
-                        FREEINK_DEVICE_WS397 ? panelBytes(WS_EPAPER_397) : 0u)))));
+                        cmax(FREEINK_DEVICE_WS397 ? panelBytes(WS_EPAPER_397) : 0u,
+                             FREEINK_DEVICE_EMINIMAL ? panelBytes(EMINIMAL_78) : 0u))))));
 
 // Compile-time default device — the profile ACTIVE starts as. With a single
 // device in the build this is the only device; with several same-MCU devices it
