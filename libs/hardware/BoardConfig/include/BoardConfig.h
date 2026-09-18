@@ -338,7 +338,7 @@
 #ifndef FREEINK_SD_SDMMC
 #define FREEINK_SD_SDMMC                                                                            \
   (FREEINK_DEVICE_DELINK || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_PAPERMONO || \
-   FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_WS397)
+   FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_EMINIMAL)
 #endif
 
 // Serial log transport hint for consumer firmware. Boards can share the same MCU
@@ -1931,6 +1931,8 @@ constexpr uint32_t MAX_FRAMEBUFFER_BYTES = cmax(
 // is the boot default until the consumer calls selectDevice().
 #if FREEINK_DEVICE_WS397
 constexpr BoardProfile DEFAULT_DEVICE = WS_EPAPER_397;
+#elif FREEINK_DEVICE_EMINIMAL
+constexpr BoardProfile DEFAULT_DEVICE = EMINIMAL_78;
 #elif FREEINK_DEVICE_ONEPAGE
 constexpr BoardProfile DEFAULT_DEVICE = ONEPAGE;
 #elif FREEINK_DEVICE_PAPERMONO

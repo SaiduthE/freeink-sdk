@@ -391,24 +391,32 @@ void It8951Driver::begin(EpdBus& bus) {
   _firstPaintPending = true;
 }
 
+// A refresh clears ghosting when it's a Full/Half (the consumer's stronger
+// refresh), a wake from standby (fresh image), or the periodic ghost-clear —
+// otherwise it's the differential mode. DU/DU4 leave residue that accumulates
+// across menu and activity navigation; promoting to GC16 every
+// ghostClearInterval refreshes wipes it automatically, like the X3 driver, with
+// no firmware involvement.
+uint16_t It8951Driver::resolveMode(RefreshMode mode, uint16_t differential) {
+  const bool clear = (mode != RefreshMode::Fast) || !_running || _firstPaintPending ||
+                     (_cfg.ghostClearInterval != 0 && _partialsSinceClear >= _cfg.ghostClearInterval);
+  _firstPaintPending = false;
+  _partialsSinceClear = clear ? 0 : static_cast<uint16_t>(_partialsSinceClear + 1);
+  _lastClear = clear;
+  return clear ? _cfg.fullMode : differential;
+}
+
 void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)bus;
   (void)prev;  // IT8951 holds the previous frame in its own SRAM
 
-  // A refresh clears ghosting when it's a Full/Half (the consumer's stronger
-  // refresh), a wake from standby (fresh image), or the periodic ghost-clear —
-  // otherwise it's a fast DU. DU/DU4 leave residue that accumulates across menu and
-  // activity navigation; promoting to GC16 every ghostClearInterval refreshes wipes
-  // it automatically, like the X3 driver, with no firmware involvement.
-  const bool clear = (mode != RefreshMode::Fast) || !_running || _firstPaintPending ||
-                     (_cfg.ghostClearInterval != 0 && _partialsSinceClear >= _cfg.ghostClearInterval);
-  const uint16_t dpyMode = clear ? _cfg.fullMode : _cfg.fastMode;
-  _firstPaintPending = false;
+  _baseStaged = false;  // a plain B/W display supersedes any base waiting for gray planes
+  const uint16_t dpyMode = resolveMode(mode, _cfg.fastMode);
 
 #ifdef IT8951_PROBE_DEBUG
   if (Serial)
-    Serial.printf("[it8951] display() mode=%d dpyMode=%u clear=%d n=%u running=%d turnOff=%d\n", (int)mode, dpyMode,
-                  clear, _partialsSinceClear, _running, turnOff);
+    Serial.printf("[it8951] display() mode=%d dpyMode=%u n=%u running=%d turnOff=%d\n", (int)mode, dpyMode,
+                  _partialsSinceClear, _running, turnOff);
 #endif
 
   // Snapshot this B/W frame: the consumer clears the live framebuffer during its
@@ -419,13 +427,25 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   displayArea(0, 0, _panelW, _panelH, dpyMode);
   waitDisplayReady();
 
-  _partialsSinceClear = clear ? 0 : static_cast<uint16_t>(_partialsSinceClear + 1);
-  _lastClear = clear;
-
   if (turnOff) {
     writeCommand(CMD_STANDBY);  // park the controller; next load re-runs SYS_RUN
     _running = false;
   }
+}
+
+// Combined base: nothing goes to the panel here. Snapshot the B/W frame and the
+// refresh the host wanted for it; displayGray() folds the planes in and drives
+// the glass once. If there is no snapshot buffer, fall back to a plain display so
+// the page still appears (the gray pass then re-refreshes, as before).
+void It8951Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
+  if (!_base || !fb) {
+    display(bus, fb, nullptr, fallback, turnOff);
+    return;
+  }
+  memcpy(_base, fb, static_cast<size_t>(_fbWb) * _fbH);
+  _baseStaged = true;
+  _stagedMode = fallback;
+  _stagedTurnOff = turnOff;
 }
 
 void It8951Driver::deepSleep(EpdBus& bus) {
@@ -475,11 +495,20 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   }
 #endif
   loadImageGray(base);  // base = snapshot B/W; LSB/MSB already buffered
-  // DU4 is a differential update: only changed pixels (the AA glyph edges) move, so
-  // a full-panel refresh refines the edges without a flash. On a page the B/W pass
-  // already promoted to a GC16 clear, do the same here so ghosting clears fully.
-  const uint16_t gmode = (_lastClear || _firstPaintPending) ? _cfg.fullMode : _cfg.grayMode;
-  _firstPaintPending = false;
+  // Staged base (the normal path): this is the page's only refresh, so it takes
+  // the mode the host asked for -- GC16 on its clearing cadence, else DU4, a
+  // 4-level differential update that moves only the changed pixels, no flash.
+  // Legacy path (a B/W display() already ran): refine the edges with DU4, or
+  // GC16 if that pass was a clear so ghosting clears fully.
+  uint16_t gmode;
+  if (_baseStaged) {
+    gmode = resolveMode(_stagedMode, _cfg.grayMode);
+    turnOff = turnOff || _stagedTurnOff;
+    _baseStaged = false;
+  } else {
+    gmode = (_lastClear || _firstPaintPending) ? _cfg.fullMode : _cfg.grayMode;
+    _firstPaintPending = false;
+  }
   displayArea(0, 0, _panelW, _panelH, gmode);
   waitDisplayReady();
   if (turnOff) {
@@ -490,9 +519,14 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
 
 void It8951Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   // Nothing to re-sync: the IT8951 holds its own frame, and the next display()
-  // reloads the framebuffer wholesale. The base B/W frame is left untouched.
-  (void)bus;
+  // reloads the framebuffer wholesale. The base B/W frame is left untouched --
+  // unless it is still only staged (the gray pass was skipped or failed), in
+  // which case put it on the glass as plain B/W rather than lose the page.
   (void)bw;
+  if (_baseStaged) {
+    _baseStaged = false;
+    display(bus, _base, nullptr, _stagedMode, _stagedTurnOff);
+  }
 }
 
 // Per-board injection mirrors the other drivers: a board wiring the IT8951
