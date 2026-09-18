@@ -2,8 +2,9 @@
 
 #include <BoardConfig.h>
 
-// Compiled only into the M5Paper (classic ESP32) build; the body uses VSPI and
-// other classic-ESP32-only symbols, so other MCU builds skip it entirely.
+// Linked only for the IT8951 devices (M5Paper v1.1 on the classic ESP32,
+// e-Minimal 7.8" on the ESP32-S3). The body is plain Arduino SPIClass, so it is
+// not tied to one MCU family.
 #if FREEINK_DRIVER_IT8951
 
 #include <driver/gpio.h>
@@ -208,6 +209,7 @@ void It8951Driver::waitDisplayReady() {
 // byte, leftmost pixel in the high nibble. The whole image rides one CS-low burst
 // after a single PRE_WR preamble (per-word framing would be far too slow).
 void It8951Driver::loadImageFull(const uint8_t* fb) {
+  if (!_rowBuf) return;  // begin() could not allocate the row buffer; nothing to stream
   if (!_running) {
     systemRun();
     _running = true;
@@ -222,10 +224,8 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
   writeData(_fbW);  // w (image space)
   writeData(_fbH);  // h
 
-  static uint8_t rowBuf[960 / 2];  // sized to the widest supported row (960 px, M5Paper)
-  // Guard: clamp to the buffer so a wider injected geometry truncates the row
-  // instead of overrunning the static buffer (each src byte -> 4 output bytes).
-  const uint16_t maxXb = _fbWb <= sizeof(rowBuf) / 4 ? _fbWb : static_cast<uint16_t>(sizeof(rowBuf) / 4);
+  uint8_t* rowBuf = _rowBuf;  // _fbW / 2 bytes, allocated in begin()
+  const uint16_t maxXb = _fbWb;
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);  // 4bpp -> 2 px per byte
 
   waitReady();
@@ -253,6 +253,7 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
 // Same rotation/streaming path as loadImageFull, but each pixel's nibble is the
 // 4-level gray reconstructed from the B/W base + the buffered LSB/MSB planes.
 void It8951Driver::loadImageGray(const uint8_t* base) {
+  if (!_rowBuf) return;
   if (!_running) {
     systemRun();
     _running = true;
@@ -268,10 +269,8 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   writeData(_fbH);  // h
 
   const bool haveGray = _gLsb && _gMsb;
-  static uint8_t rowBuf[960 / 2];  // sized to the widest supported row (960 px, M5Paper)
-  // Guard: clamp to the buffer so a wider injected geometry truncates the row
-  // instead of overrunning the static buffer (each src byte -> 4 output bytes).
-  const uint16_t maxXb = _fbWb <= sizeof(rowBuf) / 4 ? _fbWb : static_cast<uint16_t>(sizeof(rowBuf) / 4);
+  uint8_t* rowBuf = _rowBuf;  // _fbW / 2 bytes, allocated in begin()
+  const uint16_t maxXb = _fbWb;
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);
 
   waitReady();
@@ -353,6 +352,13 @@ void It8951Driver::begin(EpdBus& bus) {
   if (!_gLsb) _gLsb = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
   if (!_gMsb) _gMsb = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
   if (!_base) _base = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
+  // One 4bpp row for the load loops, sized to this panel (936 B on 1872 px,
+  // 480 B on M5Paper's 960). Internal RAM: SPI writeBytes reads it every row.
+  if (!_rowBuf) {
+    const size_t rowBytes = static_cast<size_t>(_fbWb) * 4;
+    _rowBuf = static_cast<uint8_t*>(heap_caps_malloc(rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!_rowBuf) _rowBuf = static_cast<uint8_t*>(malloc(rowBytes));
+  }
 
   waitReady();
   getDeviceInfo();
@@ -495,6 +501,12 @@ void It8951Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
 #ifdef FREEINK_IT8951_CONFIG
 const It8951Config& FREEINK_IT8951_CONFIG();
 static const It8951Config& it8951ActiveConfig() { return FREEINK_IT8951_CONFIG(); }
+#elif FREEINK_DEVICE_EMINIMAL
+// Supplied by the SDK's BoardEMinimal78 library (add it to lib_deps): MISO 17,
+// VCOM from the FPC, and the M841 LUT's mode numbers. The M5Paper default
+// below would put MISO on this board's SD D0 and run grayscale through A2.
+const It8951Config& eminimal78It8951Config();
+static const It8951Config& it8951ActiveConfig() { return eminimal78It8951Config(); }
 #else
 static const It8951Config& it8951ActiveConfig() { return it8951DefaultConfig(); }
 #endif
