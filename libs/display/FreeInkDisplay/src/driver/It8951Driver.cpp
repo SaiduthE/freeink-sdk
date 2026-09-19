@@ -361,6 +361,14 @@ void It8951Driver::begin(EpdBus& bus) {
   }
 
   waitReady();
+  // SYS_RUN before anything else. deepSleep() leaves the controller in CMD_SLEEP,
+  // and on boards whose IT8951 rail is not switched and whose RST is unassigned
+  // (eMinimal bench: HAT 5V straight off the devkit) it stays there across the
+  // host's deep-sleep wake and even an EN reset — GET_DEV_INFO then reads nothing
+  // (the fallback geometry hides it), every wait returns instantly and the glass
+  // never changes until a power cycle. Only SYS_RUN wakes it; on a running
+  // controller it is a no-op. Waveshare's and M5EPD's init order is the same.
+  systemRun();
   getDeviceInfo();
   writeReg(REG_I80CPCR, 0x0001);  // enable host packed write
   setVcom(_cfg.vcomMv);
