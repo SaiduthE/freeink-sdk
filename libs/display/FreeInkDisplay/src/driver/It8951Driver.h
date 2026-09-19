@@ -74,18 +74,45 @@ class It8951Driver : public PanelDriver {
   uint16_t readReg(uint16_t reg);
 
   // --- IT8951 operations ---
+  uint32_t loadClockHz() const { return _cfg.loadSpiHz ? _cfg.loadSpiHz : _cfg.spiHz; }
   void systemRun();
   void getDeviceInfo();
   void setTargetMemoryAddr(uint32_t addr);
   void setVcom(uint16_t mv);
   void loadImageFull(const uint8_t* fb);  // expand 1bpp framebuffer -> 4bpp into controller SRAM
+  // The same expansion for the framebuffer rectangle spanning byte columns
+  // xb0..xb1 (8-px units) and rows y0..y1, inclusive, loaded at the matching
+  // place in controller SRAM. loadImageFull() is the whole-frame case.
+  void loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1);
+  // Rows y0..y1 at full width. Partial display() loads use this rather than the
+  // exact box: a load with a non-zero x offset scattered a centred cover image
+  // along the right edge on the eMinimal bench (2026-09-18), so the horizontal
+  // extent of a box is trusted for the refresh area only, never for the load.
+  void loadImageBand(const uint8_t* fb, uint16_t y0, uint16_t y1) {
+    loadImageArea(fb, 0, static_cast<uint16_t>(_fbWb - 1), y0, y1);
+  }
+  // Bounding box of the bytes that differ between fb and _base, in the units
+  // loadImageArea() takes. False when nothing differs.
+  bool diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1) const;
   void loadImageGray(const uint8_t* base);  // combine base + LSB/MSB planes -> 4bpp into controller SRAM
   void displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode);
   void waitDisplayReady();                // poll LUT-busy register
   // Pick the waveform for a refresh the host asked for in `mode`: a clearing
   // GC16 for Full/Half, the first paint, a wake, or the periodic ghost-clear;
-  // otherwise `differential` (DU for B/W, DU4 for gray). Updates the counters.
-  uint16_t resolveMode(RefreshMode mode, uint16_t differential);
+  // otherwise `differential` (DU for B/W, DU4 for gray). Updates the counters;
+  // `weight` is the refresh's share of a whole frame in 1/256ths.
+  static constexpr uint16_t FRAME_WEIGHT = 256;
+  uint16_t resolveMode(RefreshMode mode, uint16_t differential, uint16_t weight = FRAME_WEIGHT, bool force = false);
+  // Grow the region left with DU residue by partial-area moves since the last
+  // clear (framebuffer byte columns and rows, inclusive); a screen change with
+  // that region non-empty is promoted to a clear.
+  void dirtyUnion(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1);
+  // Whether the frame memory shows anti-aliased gray inside a box (from the
+  // buffered planes), and forgetting the planes once a box is loaded as B/W.
+  bool grayWithin(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1) const;
+  void clearPlanesWithin(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1);
+  // Build the base/LSB/MSB -> 4bpp combine table (see loadImageGray).
+  void buildGrayTable();
 
   const It8951Config& _cfg;
   // Reference to the Arduino global SPI bus (VSPI on ESP32) — the SAME object the
@@ -109,8 +136,19 @@ class It8951Driver : public PanelDriver {
   // Automatic ghost-clear: count differential (DU/DU4) refreshes and promote to a
   // GC16 clear every ghostClearInterval. _lastClear lets the gray pass match the
   // B/W pass on a clearing page.
-  uint16_t _partialsSinceClear = 0;
+  uint32_t _partialsSinceClear = 0;  // in FRAME_WEIGHT units
   bool _lastClear = true;
+  // Region driven differentially since the last clear, see dirtyUnion().
+  bool _dirtyValid = false;
+  uint16_t _dirtyXb0 = 0, _dirtyXb1 = 0, _dirtyY0 = 0, _dirtyY1 = 0;
+  // The frame memory holds anti-aliased gray from the buffered planes (set by
+  // displayGray, cleared by a whole-frame B/W load). Gates grayWithin().
+  bool _memHasGray = false;
+  // Combine table for loadImageGray(): index (base nibble << 8 | lsb nibble << 4
+  // | msb nibble) -> the two 4bpp output bytes for those four pixels, first
+  // byte in the high half. 8 KB, internal RAM, built once in begin(). Replaces
+  // eight gray4() calls per framebuffer byte (2.6 M per page).
+  uint16_t* _grayTab = nullptr;
   // begin() power-cycles the rail and INIT-wipes the glass, so there is no
   // retained frame for a differential first paint (the consumer's seamless
   // fast-wake assumes one). Promote the first content refresh to GC16.
@@ -133,6 +171,14 @@ class It8951Driver : public PanelDriver {
   // buffer is black — we use this snapshot (captured before the clear) as the
   // true base instead.
   uint8_t* _base = nullptr;
+  // True while the controller's frame memory holds what _base describes (the
+  // B/W content of every pixel; gray pages differ only in the AA edges, which
+  // is what the glass shows anyway). Then a differential display() can diff the
+  // new frame against _base and load and refresh only the rectangle that
+  // changed -- a menu highlight is ~100 rows of 1404, so the 1.1 s whole-frame
+  // push becomes ~80 ms. False after begin() (INIT wiped the glass, memory is
+  // stale or unknown) and while a base is staged but not yet loaded.
+  bool _memMirrorsBase = false;
   // A base staged by displayGrayscaleBase() and not yet on the glass. displayGray()
   // commits it with the mode the host asked for; cleanupGrayscaleBuffers() flushes
   // it as plain B/W if the gray pass never arrived, so a page is never lost.
