@@ -8,6 +8,33 @@ namespace freeink {
 // orientation so the landscape framebuffer lands upright on the portrait panel.
 constexpr uint16_t IT8951_ROTATE_AUTO = 0xFF;
 
+// How begin() clears the glass when the host wakes from deep sleep with the
+// sleep cover still showing. Every boot starts with one INIT; this is what
+// follows it. Judge on real pages: the residue is a faint shadow of the cover
+// in the white margins after a wake, and a torture-pattern result (eMinimal's
+// M841 glass cleared a checkerboard in one INIT at G2) does not predict it —
+// the cover ghosted after a single INIT on the same glass.
+enum class It8951WakeScrub : uint8_t {
+  WhiteGc16AndInit = 0,  // + white GC16 (a full-frame push) + INIT. Default; M5Paper.
+  SecondInit,            // + INIT. Two passes without the push. Ghosted on eMinimal:
+                         // the white GC16 is the pass that clears, not the INIT.
+  None,                  // the boot INIT only. Cheapest; ghosted on eMinimal.
+  WhiteGc16,             // + white GC16, no trailing INIT.
+};
+
+// Pixel depth of the image loads. The host's frames only ever carry four
+// levels -- black, dark (0x5), light (0xA), white -- so 2bpp would be lossless
+// if the controller expanded a 2-bit value v to the 4-bit v*5, and it halves
+// the bytes on the wire: 1.31 MB -> 657 KB per full frame. Measured on the
+// eMinimal 7.8" (IT8951E, LUT M841) 2026-09-18: it expands v<<2 -- white lands
+// at 0xC, every page background comes up grey and a "white" GC16 ghosts. Kept
+// as an option for a controller/firmware that maps it differently; do not
+// enable without judging a page on glass.
+enum class It8951LoadDepth : uint8_t {
+  Bpp4 = 0,  // native 16-gray packing, two pixels per byte. Default; M5Paper.
+  Bpp2,      // four pixels per byte; levels 0/4/8/12 on the IT8951E tested.
+};
+
 // IT8951 wiring and per-panel values. Geometry is not here; it comes from the
 // active BoardProfile (and GET_DEV_INFO at runtime), like all drivers. A board
 // supplies one of these via -DFREEINK_IT8951_CONFIG=yourConfig, or the SDK's
@@ -28,10 +55,24 @@ struct It8951Config {
                       // update: differential, so only changed pixels (the AA glyph
                       // edges) move — no flash. GC16 (2) would drive every pixel.
   uint16_t ghostClearInterval;  // promote a differential (DU/DU4) refresh to a GC16
-                                // ghost-clear every N partials (0 = never). Keeps
-                                // DU/DU4 residue from accumulating across menu and
-                                // activity navigation, with no firmware involvement.
+                                // ghost-clear every N whole frames of differential
+                                // refresh (0 = never). A partial-area refresh (a
+                                // menu highlight move) counts its share of the
+                                // frame, at least a quarter, so a scroll does not
+                                // flash every N presses the way N page turns do.
+                                // Keeps DU/DU4 residue from accumulating across
+                                // menu and activity navigation, with no firmware
+                                // involvement.
   uint32_t imgBufFallbackAddr;  // used only if GET_DEV_INFO returns no buffer address
+  It8951WakeScrub wakeScrub;    // what follows the boot INIT on a deep-sleep wake;
+                                // see the enum. Value-initialised (0) = the default
+                                // scrub for configs that do not name it.
+  It8951LoadDepth loadDepth;    // bits per pixel on the wire for every image load.
+                                // Value-initialised (0) = 4bpp, the native 16-gray.
+  uint32_t loadSpiHz;           // SPI clock for the bulk image write only; 0 = spiHz.
+                                // Reads (device info, registers, HRDY-paced words)
+                                // are what fail first on long MISO runs, so a board
+                                // can push frames faster than it can talk.
 };
 
 }  // namespace freeink
