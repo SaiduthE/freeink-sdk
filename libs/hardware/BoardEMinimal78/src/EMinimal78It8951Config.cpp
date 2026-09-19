@@ -20,9 +20,11 @@ const It8951Config& eminimal78It8951Config() {
   static const It8951Config cfg = {
       17,        // miso: the HAT's own MISO. The driver default (13) is this board's
                  // SD D0 -- the card is on SDMMC, the panel has a bus of its own.
-      10000000,  // spiHz: 10 MHz. 13.3 was also clean on jumpers; 16 stalled HRDY on
-                 // one run in four; 20 corrupts the 20-word GET_DEV_INFO read.
-                 // Re-sweep on a PCB.
+      13333333,  // spiHz: 13.3 MHz (the S3 rounds a request DOWN to 80/N; 13.33 is
+                 // 80/6, so ask for exactly that). Clean on every G2 run at 10 and
+                 // 13.3; 16 stalled HRDY on one run in four; 20 corrupts the 20-word
+                 // GET_DEV_INFO read. Push 1107 -> 842 ms per 4bpp frame. Re-sweep
+                 // on a PCB.
       IT8951_ROTATE_AUTO,  // panel reports 1872x1404 landscape -> rotation 0
       1920,      // vcomMv: -1.92 V from the FPC's QR sticker. The controller shipped
                  // at -2.50 V, which left a checkerboard ghost through a GC16; and
@@ -34,6 +36,25 @@ const It8951Config& eminimal78It8951Config() {
       7,         // grayMode  = DU4 on M841 (see above), 359 ms, 4-level direct.
       8,         // ghostClearInterval: GC16 every 8 differential refreshes.
       0x00124850,  // imgBufFallbackAddr: this HAT's buffer base per GET_DEV_INFO.
+      It8951WakeScrub::WhiteGc16,  // wake from the sleep cover with INIT + white GC16.
+                 // Judged on real pages 2026-09-18: the default scrub (INIT + white
+                 // GC16 + INIT, 4.8 s of a 7.5 s wake) left no shadow; the boot INIT
+                 // alone ghosted, and so did INIT + INIT -- even though G2 saw one
+                 // INIT clear a checkerboard on this glass, the cover's black field
+                 // needs the GC16 drive to white. Under test: whether the trailing
+                 // INIT adds anything; flip to WhiteGc16AndInit if this ghosts.
+      It8951LoadDepth::Bpp4,  // 2bpp was tried 2026-09-18 and the controller expands a
+                 // 2-bit v to v<<2, not v*5: white landed at 0xC and every page came
+                 // up grey, and the wake scrub's "white" GC16 pass ghosted badly. The
+                 // half-size push (gray_display 1.1 s vs 1.55 at 13.3 MHz) wants the
+                 // IT8951's 1bpp bitmap mode (BGVR fg/bg levels) for B/W frames
+                 // instead; not built yet.
+      20000000,  // loadSpiHz: the bulk image write at 20 MHz (80/4). G2 measured the
+                 // 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
+                 // read failed there -- reads run out first on jumpers -- so only
+                 // the write-only burst takes the fast clock; commands, reads and
+                 // HRDY-paced words stay on spiHz. Under test: a multi-second
+                 // freeze (HRDY stall) means back to 0 = spiHz. Re-sweep on a PCB.
   };
   return cfg;
 }

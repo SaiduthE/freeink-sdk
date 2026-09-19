@@ -39,6 +39,7 @@ constexpr uint16_t REG_LISAR = 0x0208;    // load-image start address (low word;
 constexpr uint16_t REG_LUTAFSR = 0x1224;  // LUT engine busy (0 = idle)
 
 // LD_IMG arg fields: (endian << 8) | (bpp << 4) | rotation.
+constexpr uint16_t BPP_2 = 0x00;       // 2 bits/pixel (four levels, expanded by the controller)
 constexpr uint16_t BPP_4 = 0x02;       // 4 bits/pixel (native 16-gray)
 constexpr uint16_t ENDIAN_BIG = 0x01;  // big-endian pixel words
 
@@ -54,6 +55,17 @@ inline uint8_t gray4(uint8_t base, uint8_t lsb, uint8_t msb, uint8_t mask) {
   if (m) return 0xA;       // light
   if (l) return 0x5;       // dark
   return 0x0;              // black
+}
+
+// The same pixel as a 2bpp level, 3/2/1/0 -- exactly gray4()'s four values if
+// the controller expands v to v*5. The IT8951E on the eMinimal bench expands
+// v<<2 (white = 0xC, grey), which is why It8951LoadDepth::Bpp2 is off there.
+inline uint8_t gray2(uint8_t base, uint8_t lsb, uint8_t msb, uint8_t mask) {
+  if (base & mask) return 3;  // white
+  const bool l = lsb & mask, m = msb & mask;
+  if (m && !l) return 2;  // light
+  if (m || l) return 1;   // dark
+  return 0;               // black
 }
 }  // namespace
 
@@ -209,6 +221,14 @@ void It8951Driver::waitDisplayReady() {
 // byte, leftmost pixel in the high nibble. The whole image rides one CS-low burst
 // after a single PRE_WR preamble (per-word framing would be far too slow).
 void It8951Driver::loadImageFull(const uint8_t* fb) {
+  loadImageArea(fb, 0, static_cast<uint16_t>(_fbWb - 1), 0, static_cast<uint16_t>(_fbH - 1));
+}
+
+// The rectangle case. LD_IMG_AREA takes x/w in pixels; a framebuffer byte is 8
+// pixels, which keeps every edge on the 4-px word boundary the 4bpp packing
+// wants. The controller places the rows at (x, y) in its frame memory, so the
+// pixels outside the rectangle keep whatever the last load put there.
+void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1) {
   if (!_rowBuf) return;  // begin() could not allocate the row buffer; nothing to stream
   if (!_running) {
     systemRun();
@@ -216,31 +236,46 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
   }
   setTargetMemoryAddr(_imgBufAddr);
 
-  const uint16_t arg = static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_4 << 4) | (_rotation & 0x03));
+  const bool twoBpp = _cfg.loadDepth == It8951LoadDepth::Bpp2;
+  const uint16_t widthBytes = static_cast<uint16_t>(xb1 - xb0 + 1);
+  const uint16_t arg =
+      static_cast<uint16_t>((ENDIAN_BIG << 8) | ((twoBpp ? BPP_2 : BPP_4) << 4) | (_rotation & 0x03));
   writeCommand(CMD_LD_IMG_AREA);
   writeData(arg);
-  writeData(0);     // x
-  writeData(0);     // y
-  writeData(_fbW);  // w (image space)
-  writeData(_fbH);  // h
+  writeData(static_cast<uint16_t>(xb0 * 8));         // x (image space)
+  writeData(y0);                                     // y
+  writeData(static_cast<uint16_t>(widthBytes * 8));  // w
+  writeData(static_cast<uint16_t>(y1 - y0 + 1));     // h
 
   uint8_t* rowBuf = _rowBuf;  // _fbW / 2 bytes, allocated in begin()
-  const uint16_t maxXb = _fbWb;
-  const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);  // 4bpp -> 2 px per byte
+  // 4bpp: 2 px per byte, a framebuffer byte becomes 4; 2bpp: 4 px per byte, 2.
+  const uint16_t rowOutBytes = static_cast<uint16_t>(widthBytes * (twoBpp ? 2 : 4));
 
   waitReady();
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
+  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(PRE_WR);
-  for (uint16_t y = 0; y < _fbH; y++) {
-    const uint8_t* src = fb + static_cast<uint32_t>(y) * _fbWb;
+  for (uint16_t y = y0; y <= y1; y++) {
+    const uint8_t* src = fb + static_cast<uint32_t>(y) * _fbWb + xb0;
     uint16_t o = 0;
-    for (uint16_t xb = 0; xb < maxXb; xb++) {
-      const uint8_t b = src[xb];
-      rowBuf[o++] = static_cast<uint8_t>(((b & 0x80) ? 0xF0 : 0x00) | ((b & 0x40) ? 0x0F : 0x00));
-      rowBuf[o++] = static_cast<uint8_t>(((b & 0x20) ? 0xF0 : 0x00) | ((b & 0x10) ? 0x0F : 0x00));
-      rowBuf[o++] = static_cast<uint8_t>(((b & 0x08) ? 0xF0 : 0x00) | ((b & 0x04) ? 0x0F : 0x00));
-      rowBuf[o++] = static_cast<uint8_t>(((b & 0x02) ? 0xF0 : 0x00) | ((b & 0x01) ? 0x0F : 0x00));
+    if (twoBpp) {
+      // Spread each 1-bit pixel to 2 bits (1 -> 11 white, 0 -> 00 black),
+      // leftmost pixel in the top bits of the first byte.
+      for (uint16_t xb = 0; xb < widthBytes; xb++) {
+        const uint8_t b = src[xb];
+        rowBuf[o++] = static_cast<uint8_t>(((b & 0x80) ? 0xC0 : 0) | ((b & 0x40) ? 0x30 : 0) |
+                                           ((b & 0x20) ? 0x0C : 0) | ((b & 0x10) ? 0x03 : 0));
+        rowBuf[o++] = static_cast<uint8_t>(((b & 0x08) ? 0xC0 : 0) | ((b & 0x04) ? 0x30 : 0) |
+                                           ((b & 0x02) ? 0x0C : 0) | ((b & 0x01) ? 0x03 : 0));
+      }
+    } else {
+      for (uint16_t xb = 0; xb < widthBytes; xb++) {
+        const uint8_t b = src[xb];
+        rowBuf[o++] = static_cast<uint8_t>(((b & 0x80) ? 0xF0 : 0x00) | ((b & 0x40) ? 0x0F : 0x00));
+        rowBuf[o++] = static_cast<uint8_t>(((b & 0x20) ? 0xF0 : 0x00) | ((b & 0x10) ? 0x0F : 0x00));
+        rowBuf[o++] = static_cast<uint8_t>(((b & 0x08) ? 0xF0 : 0x00) | ((b & 0x04) ? 0x0F : 0x00));
+        rowBuf[o++] = static_cast<uint8_t>(((b & 0x02) ? 0xF0 : 0x00) | ((b & 0x01) ? 0x0F : 0x00));
+      }
     }
     _spi.writeBytes(rowBuf, rowOutBytes);
   }
@@ -248,6 +283,49 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
   _spi.endTransaction();
 
   writeCommand(CMD_LD_IMG_END);
+}
+
+// Row-by-row memcmp against the snapshot, then the first and last differing byte
+// of each differing row. ~330 KB read from each buffer, a few tens of ms from
+// PSRAM -- small next to the 1.1 s push it saves when the box is a menu band.
+bool It8951Driver::diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1) const {
+  bool any = false;
+  for (uint16_t y = 0; y < _fbH; y++) {
+    const uint8_t* a = fb + static_cast<uint32_t>(y) * _fbWb;
+    const uint8_t* b = _base + static_cast<uint32_t>(y) * _fbWb;
+    if (memcmp(a, b, _fbWb) == 0) continue;
+    uint16_t lo = 0;
+    while (a[lo] == b[lo]) lo++;
+    uint16_t hi = static_cast<uint16_t>(_fbWb - 1);
+    while (a[hi] == b[hi]) hi--;
+    if (!any) {
+      any = true;
+      y0 = y;
+      xb0 = lo;
+      xb1 = hi;
+    } else {
+      if (lo < xb0) xb0 = lo;
+      if (hi > xb1) xb1 = hi;
+    }
+    y1 = y;
+  }
+  return any;
+}
+
+void It8951Driver::buildGrayTable() {
+  if (_grayTab) return;
+  _grayTab = static_cast<uint16_t*>(heap_caps_malloc(4096 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (!_grayTab) return;  // loadImageGray falls back to gray4() per pixel
+  for (uint16_t b = 0; b < 16; b++) {
+    for (uint16_t l = 0; l < 16; l++) {
+      for (uint16_t m = 0; m < 16; m++) {
+        const uint8_t bb = static_cast<uint8_t>(b), lb = static_cast<uint8_t>(l), mb = static_cast<uint8_t>(m);
+        const uint8_t hi = static_cast<uint8_t>((gray4(bb, lb, mb, 0x8) << 4) | gray4(bb, lb, mb, 0x4));
+        const uint8_t lo = static_cast<uint8_t>((gray4(bb, lb, mb, 0x2) << 4) | gray4(bb, lb, mb, 0x1));
+        _grayTab[(b << 8) | (l << 4) | m] = static_cast<uint16_t>((hi << 8) | lo);
+      }
+    }
+  }
 }
 
 // Same rotation/streaming path as loadImageFull, but each pixel's nibble is the
@@ -260,7 +338,9 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   }
   setTargetMemoryAddr(_imgBufAddr);
 
-  const uint16_t arg = static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_4 << 4) | (_rotation & 0x03));
+  const bool twoBpp = _cfg.loadDepth == It8951LoadDepth::Bpp2;
+  const uint16_t arg =
+      static_cast<uint16_t>((ENDIAN_BIG << 8) | ((twoBpp ? BPP_2 : BPP_4) << 4) | (_rotation & 0x03));
   writeCommand(CMD_LD_IMG_AREA);
   writeData(arg);
   writeData(0);     // x
@@ -271,10 +351,10 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   const bool haveGray = _gLsb && _gMsb;
   uint8_t* rowBuf = _rowBuf;  // _fbW / 2 bytes, allocated in begin()
   const uint16_t maxXb = _fbWb;
-  const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);
+  const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * (twoBpp ? 2 : 4));
 
   waitReady();
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
+  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(PRE_WR);
   for (uint16_t y = 0; y < _fbH; y++) {
@@ -283,14 +363,38 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
     const uint8_t* lrow = haveGray ? _gLsb + rowOff : nullptr;
     const uint8_t* mrow = haveGray ? _gMsb + rowOff : nullptr;
     uint16_t o = 0;
-    for (uint16_t xb = 0; xb < maxXb; xb++) {
-      const uint8_t bb = brow[xb];
-      const uint8_t lb = haveGray ? lrow[xb] : 0;
-      const uint8_t mb = haveGray ? mrow[xb] : 0;
-      rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x80) << 4) | gray4(bb, lb, mb, 0x40));
-      rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x20) << 4) | gray4(bb, lb, mb, 0x10));
-      rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x08) << 4) | gray4(bb, lb, mb, 0x04));
-      rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x02) << 4) | gray4(bb, lb, mb, 0x01));
+    if (twoBpp) {
+      for (uint16_t xb = 0; xb < maxXb; xb++) {
+        const uint8_t bb = brow[xb];
+        const uint8_t lb = haveGray ? lrow[xb] : 0;
+        const uint8_t mb = haveGray ? mrow[xb] : 0;
+        rowBuf[o++] = static_cast<uint8_t>((gray2(bb, lb, mb, 0x80) << 6) | (gray2(bb, lb, mb, 0x40) << 4) |
+                                           (gray2(bb, lb, mb, 0x20) << 2) | gray2(bb, lb, mb, 0x10));
+        rowBuf[o++] = static_cast<uint8_t>((gray2(bb, lb, mb, 0x08) << 6) | (gray2(bb, lb, mb, 0x04) << 4) |
+                                           (gray2(bb, lb, mb, 0x02) << 2) | gray2(bb, lb, mb, 0x01));
+      }
+    } else if (_grayTab && haveGray) {
+      // Two table lookups per framebuffer byte: the high nibbles of the three
+      // planes pick the first two output bytes, the low nibbles the next two.
+      for (uint16_t xb = 0; xb < maxXb; xb++) {
+        const uint8_t bb = brow[xb], lb = lrow[xb], mb = mrow[xb];
+        const uint16_t hi = _grayTab[((bb & 0xF0) << 4) | (lb & 0xF0) | (mb >> 4)];
+        const uint16_t lo = _grayTab[((bb & 0x0F) << 8) | ((lb & 0x0F) << 4) | (mb & 0x0F)];
+        rowBuf[o++] = static_cast<uint8_t>(hi >> 8);
+        rowBuf[o++] = static_cast<uint8_t>(hi);
+        rowBuf[o++] = static_cast<uint8_t>(lo >> 8);
+        rowBuf[o++] = static_cast<uint8_t>(lo);
+      }
+    } else {
+      for (uint16_t xb = 0; xb < maxXb; xb++) {
+        const uint8_t bb = brow[xb];
+        const uint8_t lb = haveGray ? lrow[xb] : 0;
+        const uint8_t mb = haveGray ? mrow[xb] : 0;
+        rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x80) << 4) | gray4(bb, lb, mb, 0x40));
+        rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x20) << 4) | gray4(bb, lb, mb, 0x10));
+        rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x08) << 4) | gray4(bb, lb, mb, 0x04));
+        rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x02) << 4) | gray4(bb, lb, mb, 0x01));
+      }
     }
     _spi.writeBytes(rowBuf, rowOutBytes);
   }
@@ -381,22 +485,31 @@ void It8951Driver::begin(EpdBus& bus) {
   // Clear to white with the INIT waveform (ignores buffer content).
   displayArea(0, 0, _panelW, _panelH, 0);
   waitDisplayReady();
-  if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+  if (esp_reset_reason() == ESP_RST_DEEPSLEEP && _cfg.wakeScrub != It8951WakeScrub::None) {
     // Waking with the sleep cover on the glass: INIT alone leaves faint
-    // residue of dark art (most visible in dithered fields). Drive the pigment
-    // through an explicit white GC16 between two INIT passes to scrub it.
-    // Cold boots skip the cost. _base is scratch here; the first display()
-    // re-snapshots it before use.
-    if (_base) {
+    // residue of dark art (most visible in dithered fields, and confirmed on
+    // eMinimal's glass too). Drive the pigment through a second pass: an
+    // explicit white GC16 between two INIT passes (the default), or just a
+    // second INIT where the config says that is enough. Cold boots skip the
+    // cost. _base is scratch here; the first display() re-snapshots it.
+    const bool whitePass =
+        _cfg.wakeScrub == It8951WakeScrub::WhiteGc16AndInit || _cfg.wakeScrub == It8951WakeScrub::WhiteGc16;
+    if (_base && whitePass) {
       memset(_base, 0xFF, static_cast<size_t>(_fbWb) * _fbH);
       loadImageFull(_base);
       displayArea(0, 0, _panelW, _panelH, _cfg.fullMode);
       waitDisplayReady();
     }
-    displayArea(0, 0, _panelW, _panelH, 0);
-    waitDisplayReady();
+    if (_cfg.wakeScrub != It8951WakeScrub::WhiteGc16) {
+      displayArea(0, 0, _panelW, _panelH, 0);
+      waitDisplayReady();
+    }
   }
   _firstPaintPending = true;
+  _memMirrorsBase = false;  // glass is white, memory is whatever it was: first paint reloads
+  _memHasGray = false;
+  _dirtyValid = false;
+  buildGrayTable();
 }
 
 // A refresh clears ghosting when it's a Full/Half (the consumer's stronger
@@ -404,14 +517,62 @@ void It8951Driver::begin(EpdBus& bus) {
 // otherwise it's the differential mode. DU/DU4 leave residue that accumulates
 // across menu and activity navigation; promoting to GC16 every
 // ghostClearInterval refreshes wipes it automatically, like the X3 driver, with
-// no firmware involvement.
-uint16_t It8951Driver::resolveMode(RefreshMode mode, uint16_t differential) {
-  const bool clear = (mode != RefreshMode::Fast) || !_running || _firstPaintPending ||
-                     (_cfg.ghostClearInterval != 0 && _partialsSinceClear >= _cfg.ghostClearInterval);
+// no firmware involvement. `weight` is this refresh's share of a whole frame in
+// 1/256ths: a partial-area menu move counts its box, so a scroll does not flash
+// every eight presses the way eight page turns do.
+uint16_t It8951Driver::resolveMode(RefreshMode mode, uint16_t differential, uint16_t weight, bool force) {
+  const bool clear = force || (mode != RefreshMode::Fast) || !_running || _firstPaintPending ||
+                     (_cfg.ghostClearInterval != 0 &&
+                      _partialsSinceClear >= static_cast<uint32_t>(_cfg.ghostClearInterval) * FRAME_WEIGHT);
   _firstPaintPending = false;
-  _partialsSinceClear = clear ? 0 : static_cast<uint16_t>(_partialsSinceClear + 1);
+  _partialsSinceClear = clear ? 0 : _partialsSinceClear + weight;
   _lastClear = clear;
   return clear ? _cfg.fullMode : differential;
+}
+
+// Any anti-aliased (non-white, non-black) pixel inside the box, judged from the
+// buffered planes against the snapshot: a set base bit is white, a clear one
+// with either plane bit set is a gray level.
+bool It8951Driver::grayWithin(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1) const {
+  if (!_gLsb || !_gMsb || !_base) return false;
+  const uint16_t n = static_cast<uint16_t>(xb1 - xb0 + 1);
+  for (uint16_t y = y0; y <= y1; y++) {
+    const uint32_t off = static_cast<uint32_t>(y) * _fbWb + xb0;
+    const uint8_t* b = _base + off;
+    const uint8_t* l = _gLsb + off;
+    const uint8_t* m = _gMsb + off;
+    for (uint16_t i = 0; i < n; i++) {
+      if ((l[i] | m[i]) & ~b[i]) return true;
+    }
+  }
+  return false;
+}
+
+// The box now holds plain B/W in the frame memory: forget the planes there so
+// a later box over the same place is not mistaken for gray.
+void It8951Driver::clearPlanesWithin(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1) {
+  if (!_memHasGray || !_gLsb || !_gMsb) return;
+  const size_t n = static_cast<size_t>(xb1 - xb0 + 1);
+  for (uint16_t y = y0; y <= y1; y++) {
+    const uint32_t off = static_cast<uint32_t>(y) * _fbWb + xb0;
+    memset(_gLsb + off, 0, n);
+    memset(_gMsb + off, 0, n);
+  }
+}
+
+void It8951Driver::dirtyUnion(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1) {
+  if (!_dirtyValid) {
+    _dirtyXb0 = xb0;
+    _dirtyXb1 = xb1;
+    _dirtyY0 = y0;
+    _dirtyY1 = y1;
+    _dirtyValid = true;
+    return;
+  }
+  if (xb0 < _dirtyXb0) _dirtyXb0 = xb0;
+  if (xb1 > _dirtyXb1) _dirtyXb1 = xb1;
+  if (y0 < _dirtyY0) _dirtyY0 = y0;
+  if (y1 > _dirtyY1) _dirtyY1 = y1;
 }
 
 void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
@@ -419,21 +580,108 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   (void)prev;  // IT8951 holds the previous frame in its own SRAM
 
   _baseStaged = false;  // a plain B/W display supersedes any base waiting for gray planes
-  const uint16_t dpyMode = resolveMode(mode, _cfg.fastMode);
+
+  // When the controller's frame memory mirrors the snapshot, diff the new frame
+  // against it: the changed box is all that needs loading, and its share of the
+  // frame is what this refresh counts toward the periodic ghost-clear. Needs no
+  // rotation between framebuffer and panel (the box is in framebuffer
+  // coordinates and DPY_AREA takes panel ones). An empty box means the memory
+  // is already right.
+  uint16_t xb0 = 0, xb1 = 0, y0 = 0, y1 = 0;
+  const bool canDiff = _memMirrorsBase && _base && fb && _rotation == 0 && _panelW == _fbW && _panelH == _fbH;
+  const bool haveBox = canDiff && diffBox(fb, xb0, xb1, y0, y1);
+  const bool unchanged = canDiff && !haveBox;
+  const bool wholeFrame = !haveBox || (xb0 == 0 && xb1 == _fbWb - 1 && y0 == 0 && y1 == _fbH - 1);
+  bool largeBox = wholeFrame;
+  if (haveBox && !wholeFrame) {
+    const uint32_t boxArea = static_cast<uint32_t>(xb1 - xb0 + 1) * (y1 - y0 + 1);
+    largeBox = boxArea * 2 >= static_cast<uint32_t>(_fbWb) * _fbH;
+  }
+  // Gray under the box: DU is a two-level waveform, and driving anti-aliased
+  // text to white with it leaves a shadow of every glyph -- what "back to Home
+  // from a book" looked like. The planes are still buffered, so this is known
+  // before the load, and such a refresh is promoted to GC16 on the box.
+  const bool grayInBox = haveBox && _memHasGray && grayWithin(xb0, xb1, y0, y1);
+
+  // What this refresh is, and what it counts toward the periodic ghost-clear:
+  //  - unchanged: nothing driven, counts nothing;
+  //  - a partial box over B/W (a menu highlight move): DU on the box, counts
+  //    nothing (residue there is mild and the next screen change clears it);
+  //  - gray under the box: GC16 on the box; a whole-frame one is a full clear;
+  //  - a large box (a screen change): DU, one frame's worth -- or GC16 if
+  //    menu moves have left residue behind (dirty), which also resets it.
+  bool forceClear = false, boxClear = false;
+  uint16_t weight = FRAME_WEIGHT;
+  if (unchanged) {
+    weight = 0;
+  } else if (grayInBox) {
+    forceClear = true;
+    boxClear = !largeBox;
+  } else if (!largeBox) {
+    weight = 0;
+  } else if (_dirtyValid) {
+    forceClear = true;
+  }
+  // A clear the host asked for, or that the driver owes (first paint, wake from
+  // standby), resyncs everything. The others only need the box loaded.
+  const bool requestedClear = (mode != RefreshMode::Fast) || !_running || _firstPaintPending;
+  // A box-only GC16 leaves residue elsewhere, so it does not count as a clear
+  // for the periodic cadence; it just takes the clearing waveform on its box.
+  uint16_t dpyMode = resolveMode(mode, _cfg.fastMode, boxClear ? 0 : weight, forceClear && !boxClear);
+  if (boxClear) dpyMode = _cfg.fullMode;
 
 #ifdef IT8951_PROBE_DEBUG
   if (Serial)
-    Serial.printf("[it8951] display() mode=%d dpyMode=%u n=%u running=%d turnOff=%d\n", (int)mode, dpyMode,
-                  _partialsSinceClear, _running, turnOff);
+    Serial.printf("[it8951] display() mode=%d dpyMode=%u n=%lu box=%d large=%d gray=%d dirty=%d\n", (int)mode, dpyMode,
+                  (unsigned long)_partialsSinceClear, (int)haveBox, (int)largeBox, (int)grayInBox, (int)_dirtyValid);
 #endif
 
   // Snapshot this B/W frame: the consumer clears the live framebuffer during its
   // grayscale strip pass, so displayGray() needs this copy as the true base.
   if (_base && fb) memcpy(_base, fb, static_cast<size_t>(_fbWb) * _fbH);
 
-  loadImageFull(fb);
-  displayArea(0, 0, _panelW, _panelH, dpyMode);
+  if (boxClear) {
+    loadImageBand(fb, y0, y1);
+    displayArea(static_cast<uint16_t>(xb0 * 8), y0, static_cast<uint16_t>((xb1 - xb0 + 1) * 8),
+                static_cast<uint16_t>(y1 - y0 + 1), dpyMode);
+    clearPlanesWithin(0, static_cast<uint16_t>(_fbWb - 1), y0, y1);
+  } else if (!_lastClear) {
+    if (unchanged) {
+      // Nothing changed: drive nothing. A DU pass over an identical frame is
+      // not free -- it re-drives dithered fills two-level and leaves them
+      // patchy, which is what Home looked like after its second, identical
+      // paint following the GC16 out of a book.
+    } else if (!wholeFrame) {
+      loadImageBand(fb, y0, y1);
+      displayArea(static_cast<uint16_t>(xb0 * 8), y0, static_cast<uint16_t>((xb1 - xb0 + 1) * 8),
+                  static_cast<uint16_t>(y1 - y0 + 1), dpyMode);
+      clearPlanesWithin(0, static_cast<uint16_t>(_fbWb - 1), y0, y1);
+      if (!largeBox) dirtyUnion(xb0, xb1, y0, y1);
+    } else {
+      loadImageFull(fb);
+      displayArea(0, 0, _panelW, _panelH, dpyMode);
+      _memHasGray = false;
+    }
+  } else if (canDiff && !requestedClear) {
+    // A clear with the memory already right outside the box: load the box and
+    // GC16 the frame -- no whole-frame push. The periodic clear off a page or
+    // a screen change re-drives everything; a clear owed to menu residue
+    // could be narrower, but the residue is where the eye is anyway.
+    if (haveBox) {
+      loadImageBand(fb, y0, y1);
+      clearPlanesWithin(0, static_cast<uint16_t>(_fbWb - 1), y0, y1);
+      if (wholeFrame) _memHasGray = false;
+    }
+    displayArea(0, 0, _panelW, _panelH, dpyMode);
+    _dirtyValid = false;
+  } else {
+    loadImageFull(fb);
+    displayArea(0, 0, _panelW, _panelH, dpyMode);
+    _memHasGray = false;
+    _dirtyValid = false;
+  }
   waitDisplayReady();
+  _memMirrorsBase = _base && fb;
 
   if (turnOff) {
     writeCommand(CMD_STANDBY);  // park the controller; next load re-runs SYS_RUN
@@ -451,6 +699,7 @@ void It8951Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshM
     return;
   }
   memcpy(_base, fb, static_cast<size_t>(_fbWb) * _fbH);
+  _memMirrorsBase = false;  // the snapshot is ahead of the frame memory until displayGray() loads it
   _baseStaged = true;
   _stagedMode = fallback;
   _stagedTurnOff = turnOff;
@@ -503,6 +752,8 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   }
 #endif
   loadImageGray(base);  // base = snapshot B/W; LSB/MSB already buffered
+  _memMirrorsBase = base == _base;
+  _memHasGray = _gLsb && _gMsb;
   // Staged base (the normal path): this is the page's only refresh, so it takes
   // the mode the host asked for -- GC16 on its clearing cadence, else DU4, a
   // 4-level differential update that moves only the changed pixels, no flash.
@@ -519,6 +770,13 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   }
   displayArea(0, 0, _panelW, _panelH, gmode);
   waitDisplayReady();
+  // A whole-frame GC16 leaves nothing to clear; a DU4 page leaves the whole
+  // frame for the next periodic clear.
+  if (gmode == _cfg.fullMode) {
+    _dirtyValid = false;
+  } else {
+    dirtyUnion(0, static_cast<uint16_t>(_fbWb - 1), 0, static_cast<uint16_t>(_fbH - 1));
+  }
   if (turnOff) {
     writeCommand(CMD_STANDBY);
     _running = false;
