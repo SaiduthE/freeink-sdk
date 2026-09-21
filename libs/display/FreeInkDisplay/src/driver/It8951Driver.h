@@ -91,6 +91,20 @@ class It8951Driver : public PanelDriver {
   void loadImageBand(const uint8_t* fb, uint16_t y0, uint16_t y1) {
     loadImageArea(fb, 0, static_cast<uint16_t>(_fbWb - 1), y0, y1);
   }
+  // Rows y0..y1 at full width as a 1bpp bitmap (It8951LoadDepth::Bpp1): the
+  // framebuffer bytes go up unexpanded under an 8bpp header a panel-width/8
+  // wide, and the display engine is told to read the frame memory as one bit
+  // per pixel (see setBitmapMode). A quarter of the 4bpp bytes. Whether the
+  // bitmap format and the 4bpp/8bpp levels format can share the frame memory
+  // is tracked in _memBitmap; a load in the other format widens itself to the
+  // whole frame so the memory is never mixed.
+  void loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1);
+  bool bitmapLoads() const { return _cfg.loadDepth == It8951LoadDepth::Bpp1 && _rotation == 0; }
+  // Flip the display engine between reading the frame memory as 8-bit levels
+  // and as a 1bpp bitmap painted with the BGVR colour table. `force` writes
+  // the registers even when the cached state matches (begin(): the controller
+  // keeps its registers across a host reset).
+  void setBitmapMode(bool on, bool force = false);
   // Bounding box of the bytes that differ between fb and _base, in the units
   // loadImageArea() takes. False when nothing differs.
   bool diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1) const;
@@ -144,6 +158,11 @@ class It8951Driver : public PanelDriver {
   // The frame memory holds anti-aliased gray from the buffered planes (set by
   // displayGray, cleared by a whole-frame B/W load). Gates grayWithin().
   bool _memHasGray = false;
+  // The frame memory holds a 1bpp bitmap (loadImageBitmap) rather than 8-bit
+  // levels (every other load). The two cannot share a frame, so a load in the
+  // other format goes whole-frame, and displayArea() sets the engine to match.
+  bool _memBitmap = false;
+  bool _bitmapModeOn = false;  // what the UP1SR bitmap bit was last set to
   // Combine table for loadImageGray(): index (base nibble << 8 | lsb nibble << 4
   // | msb nibble) -> the two 4bpp output bytes for those four pixels, first
   // byte in the high half. 8 KB, internal RAM, built once in begin(). Replaces

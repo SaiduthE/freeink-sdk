@@ -27,12 +27,25 @@ enum class It8951WakeScrub : uint8_t {
 // if the controller expanded a 2-bit value v to the 4-bit v*5, and it halves
 // the bytes on the wire: 1.31 MB -> 657 KB per full frame. Measured on the
 // eMinimal 7.8" (IT8951E, LUT M841) 2026-09-18: it expands v<<2 -- white lands
-// at 0xC, every page background comes up grey and a "white" GC16 ghosts. Kept
-// as an option for a controller/firmware that maps it differently; do not
-// enable without judging a page on glass.
+// at 0xC, every page background comes up grey and a "white" GC16 ghosts. That
+// is the chip, not the firmware: the datasheet (V0.2.4.3 fig. 7-16) stores the
+// input bits in the top of an 8-bit pixel and zero-pads, for every depth below
+// 8bpp. Only 4bpp and 8bpp reach 0xF. 2bpp is kept for a controller that maps
+// it differently; do not enable without judging a page on glass.
+//
+// The lever that does work is the IT8951's 1bpp BITMAP mode: the frame memory
+// holds one bit per pixel and the display engine paints the two levels from a
+// colour-table register (BGVR), so black and white are exact and a full frame
+// is a quarter of the 4bpp bytes (1.31 MB -> 328 KB, ~145 ms at 20 MHz). Only
+// B/W frames can go this way; the anti-aliased gray frames stay 4bpp, and the
+// driver switches the frame memory between the two formats as needed.
 enum class It8951LoadDepth : uint8_t {
   Bpp4 = 0,  // native 16-gray packing, two pixels per byte. Default; M5Paper.
   Bpp2,      // four pixels per byte; levels 0/4/8/12 on the IT8951E tested.
+  Bpp1,      // B/W frames as a 1bpp bitmap (eight pixels per byte, BGVR levels);
+             // gray frames 4bpp. Needs load rotation 0 (the bitmap trick loads
+             // bytes as if they were 8bpp pixels, which the rotator would scramble);
+             // the driver falls back to 4bpp when the rotation is not 0.
 };
 
 // IT8951 wiring and per-panel values. Geometry is not here; it comes from the
