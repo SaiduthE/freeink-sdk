@@ -1381,15 +1381,23 @@ constexpr BoardProfile EMINIMAL_78 = {
     // the sleep path parks it HIGH to cut the rail.
     {PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 21, false, 0, false},
     // back, confirm, left, right, up, down, power, powerActiveHigh.
-    // Four buttons, active-low with internal pull-ups. Left/right unassigned:
-    // the spec's controls are Prev/Next/Select/Back-Sleep, mapped up/down/confirm/back.
-    // Power shares no pin with confirm here (unlike M5Paper) — 15 is the bench
-    // sleep/wake button and is RTC-capable, so it can serve as the ext1 wake source.
+    // Five buttons, active-low with internal pull-ups. Left/right unassigned:
+    // the spec's controls are Prev/Next/Select/Back plus Power, mapped
+    // up/down/confirm/back/power. Power is its own key on 15 (RTC-capable, the
+    // ext1 wake source): a hold wakes (HalGPIO::verifyPowerButtonWakeup) and a
+    // hold opens the power menu, so a tap in a bag does nothing. Back's long
+    // press is Home in CrossPoint, which is why sleep is not on Back.
     {7, 6, PIN_UNASSIGNED, PIN_UNASSIGNED, 4, 5, 15, false},
-    PIN_UNASSIGNED,  // batteryAdc — the battery path is G7 and is not wired yet
+    // batteryAdc: GPIO 8 = ADC1_CH7 (ADC2 is arbitrated with WiFi and fails
+    // during hotspot/join). 2 x 470k divider from the cell with 100 nF across
+    // the lower leg — the S3's sample-and-hold starves on a 470k source without
+    // it. Bench: a 10k pot across 3V3 stands in for the cell until one exists.
+    8,
     PIN_UNASSIGNED,  // batteryChargeStatus
-    2.0f,            // batteryDividerMultiplier (assumes the usual 2:1 divider)
-    PIN_UNASSIGNED,  // usbDetect
+    2.0f,            // batteryDividerMultiplier: equal legs, so cell = 2 x ADC
+    PIN_UNASSIGNED,  // usbDetect — reserved GPIO 9 from the charger's 5 V input via
+                     // 100k/100k; when it is wired, exempt EMINIMAL from the
+                     // AfterUSBPower re-sleep in main.cpp first
     NO_TOUCH,        // four buttons by design: touch on e-ink fights the refresh cycle
     NO_FRONTLIGHT,
     NO_AUDIO,
