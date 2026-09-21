@@ -297,6 +297,9 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
     systemRun();
     _running = true;
   }
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tLoad = micros();
+#endif
   setTargetMemoryAddr(_imgBufAddr);
 
   // Levels over a bitmap: the two formats cannot share the frame memory, so a
@@ -356,6 +359,10 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
 
   writeCommand(CMD_LD_IMG_END);
   _memBitmap = false;
+#ifdef IT8951_TIMING_LOG
+  _loadUs += micros() - tLoad;
+  _loadBytes += static_cast<uint32_t>(widthBytes) * (twoBpp ? 2 : 4) * (y1 - y0 + 1);
+#endif
 }
 
 // The bitmap load is the trick Waveshare's EPD_IT8951_1bp_Refresh and
@@ -376,6 +383,9 @@ void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) 
     systemRun();
     _running = true;
   }
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tLoad = micros();
+#endif
   setTargetMemoryAddr(_imgBufAddr);
 
   if (!_memBitmap) {
@@ -421,6 +431,10 @@ void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) 
 
   writeCommand(CMD_LD_IMG_END);
   _memBitmap = true;
+#ifdef IT8951_TIMING_LOG
+  _loadUs += micros() - tLoad;
+  _loadBytes += static_cast<uint32_t>(_fbWb) * (y1 - y0 + 1);
+#endif
 }
 
 // Row-by-row memcmp against the snapshot, then the first and last differing byte
@@ -474,6 +488,9 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
     systemRun();
     _running = true;
   }
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tLoad = micros();
+#endif
   setTargetMemoryAddr(_imgBufAddr);
 
   const bool twoBpp = _cfg.loadDepth == It8951LoadDepth::Bpp2;
@@ -541,6 +558,10 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
 
   writeCommand(CMD_LD_IMG_END);
   _memBitmap = false;  // whole frame, levels format
+#ifdef IT8951_TIMING_LOG
+  _loadUs += micros() - tLoad;
+  _loadBytes += static_cast<uint32_t>(_fbWb) * 4 * _fbH;
+#endif
 }
 
 void It8951Driver::begin(EpdBus& bus) {
@@ -722,6 +743,11 @@ void It8951Driver::dirtyUnion(uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t 
 void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)bus;
   (void)prev;  // IT8951 holds the previous frame in its own SRAM
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tEntry = micros();
+  _loadUs = 0;
+  _loadBytes = 0;
+#endif
 
   _baseStaged = false;  // a plain B/W display supersedes any base waiting for gray planes
 
@@ -826,6 +852,9 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   }
   waitDisplayReady();
   _memMirrorsBase = _base && fb;
+#ifdef IT8951_TIMING_LOG
+  printTiming(unchanged ? "display (unchanged)" : "display", tEntry, unchanged ? 0 : dpyMode);
+#endif
 
   if (turnOff) {
     writeCommand(CMD_STANDBY);  // park the controller; next load re-runs SYS_RUN
@@ -888,6 +917,11 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   // so use the B/W snapshot captured in display() as the base. Fall back to the
   // passed buffer only if no snapshot exists yet.
   const uint8_t* base = _base ? _base : fb;
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tEntry = micros();
+  _loadUs = 0;
+  _loadBytes = 0;
+#endif
 #ifdef IT8951_PROBE_DEBUG
   if (Serial && base) {
     const uint32_t mid = static_cast<uint32_t>(_fbH / 2) * _fbWb;
@@ -914,6 +948,9 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   }
   displayArea(0, 0, _panelW, _panelH, gmode);
   waitDisplayReady();
+#ifdef IT8951_TIMING_LOG
+  printTiming("displayGray", tEntry, gmode);
+#endif
   // A whole-frame GC16 leaves nothing to clear; a DU4 page leaves the whole
   // frame for the next periodic clear.
   if (gmode == _cfg.fullMode) {
@@ -926,6 +963,22 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     _running = false;
   }
 }
+
+#ifdef IT8951_TIMING_LOG
+// One line per refresh: the bytes pushed and how long the push took, the
+// waveform that ran and what the rest of the call cost (the refresh itself,
+// plus any wait for a refresh still running on entry), and the format the
+// frame memory holds afterwards. What the bench reads to put a number on a
+// page turn or a menu move; the host's own "Page render" line brackets it.
+void It8951Driver::printTiming(const char* what, uint32_t t0Us, uint16_t dpyMode) {
+  if (!Serial) return;
+  const uint32_t totalUs = micros() - t0Us;
+  const uint32_t restUs = totalUs > _loadUs ? totalUs - _loadUs : 0;
+  Serial.printf("[it8951] %s: load %lu KB %lu ms (%s), mode %u refresh+wait %lu ms, total %lu ms\n", what,
+                (unsigned long)(_loadBytes / 1024), (unsigned long)(_loadUs / 1000), _memBitmap ? "1bpp" : "4bpp",
+                dpyMode, (unsigned long)(restUs / 1000), (unsigned long)(totalUs / 1000));
+}
+#endif
 
 void It8951Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   // Nothing to re-sync: the IT8951 holds its own frame, and the next display()
