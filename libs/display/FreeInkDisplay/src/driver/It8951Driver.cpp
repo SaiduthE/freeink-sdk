@@ -853,7 +853,9 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   waitDisplayReady();
   _memMirrorsBase = _base && fb;
 #ifdef IT8951_TIMING_LOG
-  printTiming(unchanged ? "display (unchanged)" : "display", tEntry, unchanged ? 0 : dpyMode);
+  // "same frame": the diff found nothing to load; a refresh may still have run
+  // (a clear that was owed), which the refresh+wait number shows.
+  printTiming(unchanged ? "display (same frame)" : "display", tEntry, dpyMode);
 #endif
 
   if (turnOff) {
