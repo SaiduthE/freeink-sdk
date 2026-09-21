@@ -43,12 +43,22 @@ const It8951Config& eminimal78It8951Config() {
                  // INIT clear a checkerboard on this glass, the cover's black field
                  // needs the GC16 drive to white. Under test: whether the trailing
                  // INIT adds anything; flip to WhiteGc16AndInit if this ghosts.
-      It8951LoadDepth::Bpp4,  // 2bpp was tried 2026-09-18 and the controller expands a
-                 // 2-bit v to v<<2, not v*5: white landed at 0xC and every page came
-                 // up grey, and the wake scrub's "white" GC16 pass ghosted badly. The
-                 // half-size push (gray_display 1.1 s vs 1.55 at 13.3 MHz) wants the
-                 // IT8951's 1bpp bitmap mode (BGVR fg/bg levels) for B/W frames
-                 // instead; not built yet.
+      It8951LoadDepth::Bpp1,  // B/W frames as the IT8951's 1bpp bitmap: 328 KB per
+                 // frame instead of 1.31 MB, ~145 ms at 20 MHz instead of 580;
+                 // exact black and white from the BGVR colour table. Gray (AA)
+                 // pages stay 4bpp. Judged on glass 2026-09-20, first flash: Home,
+                 // menu moves, book pages and back -- right way up, text intact,
+                 // clean page turns, no ghosting. The push has not been timed yet.
+                 // If it misbehaves on other glass or a PCB, the signatures are:
+                 //   inverted (black page, white text)  -> BGVR_BW 0x00F0 -> 0xF000
+                 //   text scrambled inside 8-px groups  -> BITMAP_LSB_FIRST -> false
+                 //   menu band wrong, whole frame right  -> BITMAP_ROW_ALIGN / the
+                 //                                          partial-load rule
+                 //   anything else                       -> Bpp4, and note it here
+                 // (the three constants are at the top of It8951Driver.cpp).
+                 // 2bpp was tried 2026-09-18: the controller expands a 2-bit v to
+                 // v<<2, not v*5 (datasheet fig. 7-16 -- the chip, not the firmware):
+                 // white landed at 0xC, every page came up grey. Not an option.
       20000000,  // loadSpiHz: the bulk image write at 20 MHz (80/4). G2 measured the
                  // 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
                  // read failed there -- reads run out first on jumpers -- so only
