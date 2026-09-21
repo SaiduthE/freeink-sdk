@@ -36,12 +36,46 @@ constexpr uint16_t CMD_VCOM = 0x0039;
 // Registers.
 constexpr uint16_t REG_I80CPCR = 0x0004;  // host packed-write enable
 constexpr uint16_t REG_LISAR = 0x0208;    // load-image start address (low word; +2 = high word)
+constexpr uint16_t REG_UP1SR = 0x1138;    // update parameter 1: +2 bit 2 = read frame memory as a 1bpp bitmap
 constexpr uint16_t REG_LUTAFSR = 0x1224;  // LUT engine busy (0 = idle)
+constexpr uint16_t REG_BGVR = 0x1250;     // bitmap colour table: [7:0] level for a 1 bit, [15:8] for a 0 bit
 
 // LD_IMG arg fields: (endian << 8) | (bpp << 4) | rotation.
 constexpr uint16_t BPP_2 = 0x00;       // 2 bits/pixel (four levels, expanded by the controller)
 constexpr uint16_t BPP_4 = 0x02;       // 4 bits/pixel (native 16-gray)
+constexpr uint16_t BPP_8 = 0x03;       // 8 bits/pixel (top nibble used) -- and the bitmap load's header
 constexpr uint16_t ENDIAN_BIG = 0x01;  // big-endian pixel words
+
+// 1bpp bitmap mode. A set framebuffer bit is white in this SDK, so a 1 bit
+// paints 0xF0 and a 0 bit 0x00 -- the value Waveshare's and PaperTTY's 1bpp
+// paths write, both of which also draw with 1 = white. If the glass comes up
+// inverted, swap the bytes (0xF000).
+constexpr uint16_t BGVR_BW = 0x00F0;
+// The engine reads each byte of the bitmap LSB-first: pixel 0 of the eight is
+// bit 0 (Waveshare's Paint lib packs 1bpp as `0x80 >> (7 - x%8)`, PaperTTY's
+// pack_1bpp puts pixel 0 at value 1). The framebuffer is MSB-first, so every
+// byte is bit-reversed on the way out. If text comes up scrambled inside
+// 8-px groups, this is the assumption to flip (send the bytes as they are).
+constexpr bool BITMAP_LSB_FIRST = true;
+// Partial bitmap loads: PaperTTY only trusts them with the height a multiple
+// of 16 (and x/w of 32; loads here are always full width). Bands are widened
+// to 16-row boundaries, and the bitmap-mode refresh box to 32-px columns.
+constexpr uint16_t BITMAP_ROW_ALIGN = 16;
+constexpr uint16_t BITMAP_COL_ALIGN = 32;
+
+struct BitReverseTable {
+  uint8_t v[256];
+  constexpr BitReverseTable() : v() {
+    for (unsigned i = 0; i < 256; i++) {
+      unsigned b = i;
+      b = ((b & 0xF0) >> 4) | ((b & 0x0F) << 4);
+      b = ((b & 0xCC) >> 2) | ((b & 0x33) << 2);
+      b = ((b & 0xAA) >> 1) | ((b & 0x55) << 1);
+      v[i] = static_cast<uint8_t>(b);
+    }
+  }
+};
+constexpr BitReverseTable kBitRev;
 
 constexpr unsigned long READY_TIMEOUT_MS = 3000;
 
@@ -195,7 +229,32 @@ void It8951Driver::setVcom(uint16_t mv) {
   writeData(mv);
 }
 
+void It8951Driver::setBitmapMode(bool on, bool force) {
+  if (!force && on == _bitmapModeOn) return;
+  waitDisplayReady();  // never change how the engine reads memory under a running refresh
+  const uint16_t up1sr2 = readReg(REG_UP1SR + 2);
+  writeReg(REG_UP1SR + 2, on ? static_cast<uint16_t>(up1sr2 | (1u << 2)) : static_cast<uint16_t>(up1sr2 & ~(1u << 2)));
+  if (on) writeReg(REG_BGVR, BGVR_BW);
+  _bitmapModeOn = on;
+#ifdef IT8951_PROBE_DEBUG
+  if (Serial) Serial.printf("[it8951] bitmap mode %s (UP1SR+2 was %04X)\n", on ? "ON" : "off", up1sr2);
+#endif
+}
+
 void It8951Driver::displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode) {
+  // The engine must read the memory the way the last load wrote it. INIT
+  // (mode 0) ignores the memory, but keeping the bit honest costs nothing.
+  setBitmapMode(_memBitmap);
+  if (_memBitmap && _rotation == 0) {
+    // Widen the box to 32-px columns: a bitmap-mode refresh of a box starting
+    // mid-word is untested (see BITMAP_COL_ALIGN); a few extra pixels of an
+    // unchanged margin are invisible.
+    const uint16_t x0 = static_cast<uint16_t>(x & ~(BITMAP_COL_ALIGN - 1));
+    uint32_t x1 = (static_cast<uint32_t>(x) + w + BITMAP_COL_ALIGN - 1) & ~static_cast<uint32_t>(BITMAP_COL_ALIGN - 1);
+    if (x1 > _panelW) x1 = _panelW;
+    x = x0;
+    w = static_cast<uint16_t>(x1 - x0);
+  }
   writeCommand(CMD_DPY_AREA);
   writeData(x);
   writeData(y);
@@ -230,12 +289,25 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
 // pixels outside the rectangle keep whatever the last load put there.
 void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, uint16_t y0, uint16_t y1) {
   if (!_rowBuf) return;  // begin() could not allocate the row buffer; nothing to stream
+  if (bitmapLoads() && xb0 == 0 && xb1 == _fbWb - 1) {
+    loadImageBitmap(fb, y0, y1);
+    return;
+  }
   if (!_running) {
     systemRun();
     _running = true;
   }
   setTargetMemoryAddr(_imgBufAddr);
 
+  // Levels over a bitmap: the two formats cannot share the frame memory, so a
+  // partial load in this format replaces the whole frame (and with it any gray).
+  if (_memBitmap) {
+    xb0 = 0;
+    xb1 = static_cast<uint16_t>(_fbWb - 1);
+    y0 = 0;
+    y1 = static_cast<uint16_t>(_fbH - 1);
+    _memHasGray = false;
+  }
   const bool twoBpp = _cfg.loadDepth == It8951LoadDepth::Bpp2;
   const uint16_t widthBytes = static_cast<uint16_t>(xb1 - xb0 + 1);
   const uint16_t arg =
@@ -283,6 +355,72 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
   _spi.endTransaction();
 
   writeCommand(CMD_LD_IMG_END);
+  _memBitmap = false;
+}
+
+// The bitmap load is the trick Waveshare's EPD_IT8951_1bp_Refresh and
+// PaperTTY's driver share: the packed 1-bit rows go up under an 8bpp header
+// declaring the image a panel-width/8 "pixels" wide, so the load engine
+// stores the bytes untouched at the start of each row of the (8-bit-pitch)
+// frame memory, and the display engine with UP1SR's bitmap bit set reads
+// them back as eight pixels each, painting the two levels from BGVR. No
+// expansion, so black and white are exact -- the thing 2bpp could not do --
+// and the whole frame is 328 KB instead of 1.31 MB.
+//
+// Rotation 0 only (bitmapLoads() checks): the rotator would rotate the byte
+// image. Rows are widened to 16-row boundaries (see BITMAP_ROW_ALIGN); the
+// extra rows carry the same content the memory already holds.
+void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) {
+  if (!_rowBuf || !fb) return;
+  if (!_running) {
+    systemRun();
+    _running = true;
+  }
+  setTargetMemoryAddr(_imgBufAddr);
+
+  if (!_memBitmap) {
+    // A bitmap over levels: replace the whole frame (see loadImageArea).
+    y0 = 0;
+    y1 = static_cast<uint16_t>(_fbH - 1);
+    _memHasGray = false;
+  } else {
+    y0 = static_cast<uint16_t>(y0 & ~(BITMAP_ROW_ALIGN - 1));
+    const uint32_t end = (static_cast<uint32_t>(y1) + BITMAP_ROW_ALIGN) & ~static_cast<uint32_t>(BITMAP_ROW_ALIGN - 1);
+    y1 = static_cast<uint16_t>((end > _fbH ? _fbH : end) - 1);
+  }
+
+  const uint16_t arg = static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_8 << 4) | 0);
+  writeCommand(CMD_LD_IMG_AREA);
+  writeData(arg);
+  writeData(0);                                  // x, in bytes of the bitmap row
+  writeData(y0);                                 // y
+  writeData(_fbWb);                              // w, in bytes (234 on 1872 px)
+  writeData(static_cast<uint16_t>(y1 - y0 + 1));  // h
+
+#ifdef IT8951_PROBE_DEBUG
+  if (Serial) Serial.printf("[it8951] bitmap load rows %u..%u (%u B/row)\n", y0, y1, _fbWb);
+#endif
+
+  uint8_t* rowBuf = _rowBuf;  // needs _fbWb bytes; allocated as _fbWb * 4
+  waitReady();
+  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
+  digitalWrite(_cs, LOW);
+  _spi.transfer16(PRE_WR);
+  for (uint16_t y = y0; y <= y1; y++) {
+    const uint8_t* src = fb + static_cast<uint32_t>(y) * _fbWb;
+    if (BITMAP_LSB_FIRST) {
+      for (uint16_t xb = 0; xb < _fbWb; xb++) rowBuf[xb] = kBitRev.v[src[xb]];
+      _spi.writeBytes(rowBuf, _fbWb);
+    } else {
+      memcpy(rowBuf, src, _fbWb);  // PSRAM -> internal RAM for the SPI FIFO
+      _spi.writeBytes(rowBuf, _fbWb);
+    }
+  }
+  digitalWrite(_cs, HIGH);
+  _spi.endTransaction();
+
+  writeCommand(CMD_LD_IMG_END);
+  _memBitmap = true;
 }
 
 // Row-by-row memcmp against the snapshot, then the first and last differing byte
@@ -402,6 +540,7 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   _spi.endTransaction();
 
   writeCommand(CMD_LD_IMG_END);
+  _memBitmap = false;  // whole frame, levels format
 }
 
 void It8951Driver::begin(EpdBus& bus) {
@@ -476,6 +615,11 @@ void It8951Driver::begin(EpdBus& bus) {
   getDeviceInfo();
   writeReg(REG_I80CPCR, 0x0001);  // enable host packed write
   setVcom(_cfg.vcomMv);
+  // The memory is whatever the last run left (levels, or a bitmap from a run
+  // with Bpp1), and so is the engine's bitmap bit: start both at levels. The
+  // first load after INIT is always whole-frame, so no stale rows survive.
+  _memBitmap = false;
+  setBitmapMode(false, /*force=*/true);
 
   // Resolve rotation: AUTO picks 90° when the panel reports portrait so the
   // landscape framebuffer lands upright.
