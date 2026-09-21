@@ -163,6 +163,14 @@ class It8951Driver : public PanelDriver {
   // other format goes whole-frame, and displayArea() sets the engine to match.
   bool _memBitmap = false;
   bool _bitmapModeOn = false;  // what the UP1SR bitmap bit was last set to
+#ifdef IT8951_TIMING_LOG
+  // Bench instrument (-DIT8951_TIMING_LOG): one serial line per display() /
+  // displayGray() with what the push and the refresh cost. The load functions
+  // add their bytes and microseconds here; display() zeroes them on entry.
+  uint32_t _loadUs = 0;
+  uint32_t _loadBytes = 0;
+  void printTiming(const char* what, uint32_t t0Us, uint16_t dpyMode);
+#endif
   // Combine table for loadImageGray(): index (base nibble << 8 | lsb nibble << 4
   // | msb nibble) -> the two 4bpp output bytes for those four pixels, first
   // byte in the high half. 8 KB, internal RAM, built once in begin(). Replaces
