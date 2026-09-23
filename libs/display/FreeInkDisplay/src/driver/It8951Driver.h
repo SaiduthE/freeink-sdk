@@ -55,6 +55,7 @@ class It8951Driver : public PanelDriver {
     return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Combined, true, false, false};
   }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
+  void repeatLastRefresh(EpdBus& bus) override;
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
   void writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const uint8_t* rows, uint16_t yStart,

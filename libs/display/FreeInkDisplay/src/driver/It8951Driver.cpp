@@ -1010,6 +1010,16 @@ static const It8951Config& it8951ActiveConfig() { return eminimal78It8951Config(
 static const It8951Config& it8951ActiveConfig() { return it8951DefaultConfig(); }
 #endif
 
+// Picture pages (XTC reader): after a dark page, a second GC16 over the new
+// page, from what the frame memory already holds -- no reload (~0.55 s).
+void It8951Driver::repeatLastRefresh(EpdBus& bus) {
+  (void)bus;
+  if (!_running) return;
+  waitDisplayReady();
+  displayArea(0, 0, _panelW, _panelH, _cfg.fullMode);
+  waitDisplayReady();
+}
+
 PanelDriver& it8951Driver() {
   static It8951Driver instance(it8951ActiveConfig());
   return instance;
