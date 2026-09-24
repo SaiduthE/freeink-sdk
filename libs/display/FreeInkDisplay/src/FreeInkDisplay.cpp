@@ -76,6 +76,17 @@ void invertBytes(uint8_t* buffer, const uint32_t size) {
     buffer[i] = static_cast<uint8_t>(~buffer[i]);
   }
 }
+
+// displayGray4()'s row source: each row copied out of the finished frame.
+struct Gray4FrameRows {
+  const uint8_t* fb4;
+  uint32_t rowBytes;
+};
+
+void gray4RowFromFrame(void* ctx, uint16_t row, uint8_t* dst) {
+  const auto* f = static_cast<const Gray4FrameRows*>(ctx);
+  memcpy(dst, f->fb4 + static_cast<uint32_t>(row) * f->rowBytes, f->rowBytes);
+}
 }  // namespace
 
 FreeInkDisplay::FreeInkDisplay(int8_t, int8_t, int8_t, int8_t, int8_t, int8_t)
@@ -837,15 +848,26 @@ void FreeInkDisplay::displayGrayCalibration(uint16_t customX, uint16_t customY, 
 
 bool FreeInkDisplay::supportsGray4() const { return !_inverted && _driver != nullptr && _driver->supportsGray4(); }
 
-bool FreeInkDisplay::displayGray4(const uint8_t* fb4, RefreshMode mode, bool turnOffScreen) {
-  if (!fb4 || !supportsGray4()) return false;
+bool FreeInkDisplay::displayGray4(const uint8_t* fb4, RefreshMode mode, bool turnOffScreen, bool updateFrameBuffer) {
+  if (!fb4) return false;
+  Gray4FrameRows rows{fb4, static_cast<uint32_t>(displayWidthBytes) * 4};
+  return displayGray4Rows(gray4RowFromFrame, &rows, mode, turnOffScreen, updateFrameBuffer);
+}
+
+bool FreeInkDisplay::displayGray4Rows(Gray4RowFill fill, void* ctx, RefreshMode mode, bool turnOffScreen,
+                                      bool updateFrameBuffer) {
+  if (!fill || !supportsGray4()) return false;
   cancelGrayscalePass();
   _grayPassFailed = false;
   syncPendingAsync();
   // Leaving inverted output: the controller's frame is the inverted one, so
   // do not let a differential waveform build on it (as displayBuffer does).
   if (_inversionDirty && mode == FAST_REFRESH) mode = HALF_REFRESH;
-  if (!_driver->displayGray4(_bus, fb4, toInternal(mode), turnOffScreen)) return false;
+  // The base goes to the live (write) framebuffer: null while its storage is
+  // lent out, and never inverted here (supportsGray4), so the driver's bits
+  // are the framebuffer's own polarity.
+  uint8_t* const baseOut = updateFrameBuffer ? frameBuffer : nullptr;
+  if (!_driver->displayGray4Rows(_bus, fill, ctx, toInternal(mode), turnOffScreen, baseOut)) return false;
   // The panel now shows neither the async shadow nor the B/W baseline.
   _shadowValid = false;
   _redRamSynced = false;

@@ -197,27 +197,38 @@ class PanelDriver {
   }
 
   // --- raw 16-level frames (controllers with native 4bpp frame memory: IT8951) ---
-  // The host hands over a finished 4bpp frame instead of B/W + LSB/MSB planes;
-  // the driver loads it whole and refreshes it as a grayscale page (grey mode
-  // on the driver's ghost-clear cadence; Full/Half ask for the clearing mode).
+  // The host hands over a finished 4bpp frame instead of B/W + LSB/MSB planes,
+  // one row at a time: `fill` (Gray4RowFill, GrayscaleCapabilities.h) is asked
+  // for every row 0 .. geometry().height - 1 in order, on the calling task,
+  // and builds it in the driver's own row buffer -- a memcpy out of a finished
+  // frame, or composed on the fly with no frame in memory at all. The driver
+  // loads the rows whole and refreshes them as a grayscale page (grey mode on
+  // the driver's ghost-clear cadence; Full/Half ask for the clearing mode).
   //
-  // Buffer layout (the contract): geometry().width x geometry().height pixels
-  // in the SAME landscape framebuffer orientation as the 1bpp frame (the driver
+  // Row layout (the contract): geometry().width x geometry().height pixels in
+  // the SAME landscape framebuffer orientation as the 1bpp frame (the driver
   // applies the same panel rotation it applies to every load); rows top to
-  // bottom, packed, stride geometry().widthBytes * 4 (= width / 2) bytes, no
+  // bottom, packed, geometry().widthBytes * 4 (= width / 2) bytes each, no
   // padding; two pixels per byte, the LEFT pixel in the HIGH nibble; 0x0 =
-  // black .. 0xF = white. Size widthBytes * 4 * height (1872x1404: 1,314,144 B).
-  // Any memory (PSRAM is fine: the driver copies rows out). The buffer is only
-  // read, and not retained past the call.
+  // black .. 0xF = white.
   //
-  // Returns false (and does nothing) where unsupported; callers gate on
-  // supportsGray4() and keep the plane path as their fallback.
+  // `baseOut`, when non-null, receives the page's 1bpp base as the driver
+  // derives it during the load -- the framebuffer layout, geometry().bufferSize
+  // bytes, a set bit white, a pixel white iff its nibble is 0xF -- whether or
+  // not the driver keeps planes of its own, so the host need not rebuild it
+  // from the frame.
+  //
+  // Returns false (and does nothing, fill never called) where unsupported;
+  // callers gate on supportsGray4() and keep the plane path as their fallback.
   virtual bool supportsGray4() const { return false; }
-  virtual bool displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mode, bool turnOff) {
+  virtual bool displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, RefreshMode mode, bool turnOff,
+                                uint8_t* baseOut) {
     (void)bus;
-    (void)fb4;
+    (void)fill;
+    (void)ctx;
     (void)mode;
     (void)turnOff;
+    (void)baseOut;
     return false;
   }
 

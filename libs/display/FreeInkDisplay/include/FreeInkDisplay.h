@@ -277,12 +277,23 @@ class FreeInkDisplay {
   // framebuffer's own (landscape, pre-rotation) orientation, packed rows of
   // gray4BufferSize() / getDisplayHeight() = getDisplayWidthBytes() * 4 bytes,
   // left pixel in the high nibble, 0x0 black .. 0xF white; any memory, read
-  // only, not retained. See PanelDriver::displayGray4. Not available while
+  // only, not retained. See PanelDriver::displayGray4Rows. Not available while
   // output is inverted (like every grayscale path); false = nothing was done,
-  // use the plane path. The live framebuffer is left untouched.
+  // use the plane path. The live framebuffer is left untouched unless
+  // `updateFrameBuffer`: then it receives the page's 1bpp base (white iff the
+  // nibble is 0xF -- the base the driver derives for its own differential
+  // bookkeeping) as the frame is loaded, so later B/W draws build on the page.
+  // displayGray4Rows() is the same page one row at a time, no frame needed:
+  // `fill` (Gray4RowFill, GrayscaleCapabilities.h) is asked for every row
+  // 0 .. getDisplayHeight() - 1 in order, on the calling task, and writes it
+  // into internal RAM valid for that call only; it must not block or allocate.
+  // False, fill never called, where unsupported.
   bool supportsGray4() const;
   uint32_t gray4BufferSize() const { return static_cast<uint32_t>(displayWidthBytes) * 4 * displayHeight; }
-  bool displayGray4(const uint8_t* fb4, RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
+  bool displayGray4(const uint8_t* fb4, RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false,
+                    bool updateFrameBuffer = false);
+  bool displayGray4Rows(Gray4RowFill fill, void* ctx, RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false,
+                        bool updateFrameBuffer = false);
 
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
 
