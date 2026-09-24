@@ -41,12 +41,35 @@ class SdmmcBlockDevice : public FsBlockDeviceInterface {
  private:
   static constexpr size_t kSectorSize = 512;
   static constexpr size_t kMaxTransferSectors = 8;
+  // Recovery back-off: a card that keeps failing (e.g. genuinely gone, or a
+  // socket fault) must not be re-mounted on every single sector op — that
+  // would busy-loop the SDMMC bus. Cap it at a few attempts per rolling minute.
+  static constexpr uint32_t kRecoveryWindowMs = 60000;
+  static constexpr int kMaxRecoveriesPerWindow = 3;
 
   // esp-idf's sdmmc_card_t is a typedef of an anonymous struct, so it can't be
   // forward-declared here (a `struct sdmmc_card_t;` tag is a different, conflicting
   // type). Hold it opaquely and cast in the .cpp, where the esp-idf header is included.
   void* _card = nullptr;
   uint8_t* _dmaBuffer = nullptr;
+  // Pin map captured in begin(), replayed by recover() to reinit the host/slot
+  // without needing the caller to pass it again.
+  BoardConfig::SdmmcPins _pins{};
+  // Timestamps (millis()) of the last few recovery attempts, used as a ring
+  // buffer to enforce kMaxRecoveriesPerWindow. 0 = unused slot.
+  uint32_t _recoveryAttemptMs[kMaxRecoveriesPerWindow] = {0};
+  int _recoveryAttemptIdx = 0;
+
+  // Host/slot/card bring-up shared by begin() (first mount) and recover()
+  // (re-mount after a wedged card): assumes _pins and _dmaBuffer are already
+  // set. Power-cycles the configured sd.powerEnable gate (if any) and retries
+  // init + a real sector-0 read up to 4 times, same as the OEM mountSD.
+  bool mount();
+  // Called from readSectors/writeSectors on a failed transfer. Deinits the
+  // host and card, then re-mounts via mount(). Rate-limited to
+  // kMaxRecoveriesPerWindow per kRecoveryWindowMs; logs
+  // "[SD] recovered card after <err>" or "[SD] recovery failed".
+  bool recover(const char* opName, int err);
 };
 
 }  // namespace freeink
