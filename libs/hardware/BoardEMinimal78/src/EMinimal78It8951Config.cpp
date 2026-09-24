@@ -63,11 +63,13 @@ const It8951Config& eminimal78It8951Config() {
                  // the 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
                  // read failed there -- reads run out first on jumpers -- so only
                  // the write-only burst takes the fast clock; commands, reads and
-                 // HRDY-paced words stay on spiHz. Under test since 2026-09-24
-                 // (was 20000000, 80/4): speckle or shifted rows on a grey page, or
-                 // a multi-second freeze (HRDY stall), mean back to 20000000. The
-                 // S3 rounds a request DOWN to 80/N, so 80/3 must be asked for as
-                 // 26666667 -- 26666666 lands on 20 MHz. Re-sweep on a PCB.
+                 // HRDY-paced words stay on spiHz. 26.67 MHz is the standard for
+                 // this board (decided 2026-09-24): a 1283 KB grey frame in
+                 // 409-414 ms (was 541-547 at 20), no DMA errors, no stalls, judged
+                 // clean on the glass. Speckle or shifted rows on a grey page, or a
+                 // multi-second freeze (HRDY stall), would mean back to 20000000.
+                 // The S3 rounds a request DOWN to 80/N, so 80/3 must be asked for
+                 // as 26666667 -- 26666666 lands on 20 MHz. 40 MHz: try on a PCB.
   };
   return cfg;
 }
