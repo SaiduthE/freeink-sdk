@@ -196,6 +196,31 @@ class PanelDriver {
     (void)bw;
   }
 
+  // --- raw 16-level frames (controllers with native 4bpp frame memory: IT8951) ---
+  // The host hands over a finished 4bpp frame instead of B/W + LSB/MSB planes;
+  // the driver loads it whole and refreshes it as a grayscale page (grey mode
+  // on the driver's ghost-clear cadence; Full/Half ask for the clearing mode).
+  //
+  // Buffer layout (the contract): geometry().width x geometry().height pixels
+  // in the SAME landscape framebuffer orientation as the 1bpp frame (the driver
+  // applies the same panel rotation it applies to every load); rows top to
+  // bottom, packed, stride geometry().widthBytes * 4 (= width / 2) bytes, no
+  // padding; two pixels per byte, the LEFT pixel in the HIGH nibble; 0x0 =
+  // black .. 0xF = white. Size widthBytes * 4 * height (1872x1404: 1,314,144 B).
+  // Any memory (PSRAM is fine: the driver copies rows out). The buffer is only
+  // read, and not retained past the call.
+  //
+  // Returns false (and does nothing) where unsupported; callers gate on
+  // supportsGray4() and keep the plane path as their fallback.
+  virtual bool supportsGray4() const { return false; }
+  virtual bool displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mode, bool turnOff) {
+    (void)bus;
+    (void)fb4;
+    (void)mode;
+    (void)turnOff;
+    return false;
+  }
+
   // --- optional, controller-specific hooks (no-op by default) ---
   virtual void requestResync(uint8_t settlePasses) { (void)settlePasses; }
   virtual void skipInitialResync() {}

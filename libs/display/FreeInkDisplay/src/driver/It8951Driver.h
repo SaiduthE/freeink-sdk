@@ -21,6 +21,11 @@
 
 #include "PanelDriver.h"
 
+// ESP-IDF spi_master types for the DMA bulk write, forward-declared so this
+// header stays free of IDF includes (it is compiled for every board).
+struct spi_device_t;
+struct spi_transaction_t;
+
 namespace freeink {
 
 const It8951Config& it8951DefaultConfig();
@@ -62,6 +67,14 @@ class It8951Driver : public PanelDriver {
                                 uint16_t numRows) override;
   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
+
+  // --- raw 16-level frames (see PanelDriver::displayGray4 for the layout) ---
+  // One whole-frame 4bpp load + one refresh, with the gray-page bookkeeping of
+  // displayGray(): the grey mode on the ghost-clear cadence, a staged base
+  // consumed, and _base/_gLsb/_gMsb re-derived from the frame so display()'s
+  // diff, grayWithin() and the dirty region keep working on the next B/W frame.
+  bool supportsGray4() const override { return true; }
+  bool displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mode, bool turnOff) override;
 
  private:
   // --- low-level SPI framing ---
@@ -113,6 +126,21 @@ class It8951Driver : public PanelDriver {
   bool diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1,
                uint32_t& changedBytes) const;
   void loadImageGray(const uint8_t* base);  // combine base + LSB/MSB planes -> 4bpp into controller SRAM
+  // A host-built 4bpp frame straight into controller SRAM (displayGray4). Also
+  // rewrites _base/_gLsb/_gMsb to describe it; returns whether it could.
+  bool loadImageGray4(const uint8_t* fb4);
+  // The one bulk-write burst every load goes through: HRDY, CS low, PRE_WR,
+  // then numRows rows of rowBytes, each produced by fill(rowIndex, dst), then
+  // CS high. With the DMA path up, rows are built in chunks into DMA buffers
+  // and queued, so chunk N+1 is built while chunk N is on the wire; otherwise
+  // (or on any DMA error) each row goes through _rowBuf and the polled
+  // SPIClass::writeBytes, exactly as before. Defined in the .cpp (only used there).
+  template <typename Fill>
+  void streamImageRows(uint16_t numRows, uint16_t rowBytes, Fill&& fill);
+  // DMA bulk-write setup (begin()) and the pin hand-over around each burst.
+  void initDmaLoad();
+  void routeLoadPinsToDma(bool toDma);
+  bool retireDmaChunk();
   void displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode);
   void waitDisplayReady();                // poll LUT-busy register
   // Pick the waveform for a refresh the host asked for in `mode`: a clearing
@@ -195,6 +223,18 @@ class It8951Driver : public PanelDriver {
   // rows — a fixed 960-px buffer would have truncated wider panels while the
   // LD_IMG_AREA header still promised the full width, scrambling the image.
   uint8_t* _rowBuf = nullptr;
+
+  // DMA bulk write (IT8951_DMA_LOAD, see the .cpp). A second SPI host with its
+  // own device takes over the SCLK/MOSI pads for the length of an image burst
+  // only; every command, register read and HRDY-paced word stays on _spi.
+  // Null _dmaDev = polled path. _dmaFailed latches after a DMA error so the
+  // driver stays on the polled path for the rest of the run.
+  static constexpr uint8_t DMA_BUFS = 3;  // chunks in flight + the one being built
+  spi_device_t* _dmaDev = nullptr;
+  spi_transaction_t* _dmaTrans = nullptr;  // DMA_BUFS descriptors, internal RAM
+  uint8_t* _dmaBuf[DMA_BUFS] = {};         // MALLOC_CAP_DMA, internal RAM
+  uint16_t _dmaChunkBytes = 0;             // capacity of each _dmaBuf
+  bool _dmaFailed = false;
 
   // Snapshot of the last B/W frame from display() or displayGrayscaleBase(). The
   // consumer's strip-grayscale pass clears the live framebuffer to 0x00 while

@@ -835,6 +835,24 @@ void FreeInkDisplay::displayGrayCalibration(uint16_t customX, uint16_t customY, 
   _driver->displayGrayCalibration(_bus, frameBuffer, customX, customY, customW, customH);
 }
 
+bool FreeInkDisplay::supportsGray4() const { return !_inverted && _driver != nullptr && _driver->supportsGray4(); }
+
+bool FreeInkDisplay::displayGray4(const uint8_t* fb4, RefreshMode mode, bool turnOffScreen) {
+  if (!fb4 || !supportsGray4()) return false;
+  cancelGrayscalePass();
+  _grayPassFailed = false;
+  syncPendingAsync();
+  // Leaving inverted output: the controller's frame is the inverted one, so
+  // do not let a differential waveform build on it (as displayBuffer does).
+  if (_inversionDirty && mode == FAST_REFRESH) mode = HALF_REFRESH;
+  if (!_driver->displayGray4(_bus, fb4, toInternal(mode), turnOffScreen)) return false;
+  // The panel now shows neither the async shadow nor the B/W baseline.
+  _shadowValid = false;
+  _redRamSynced = false;
+  _inversionDirty = false;
+  return true;
+}
+
 void FreeInkDisplay::refreshDisplay(RefreshMode mode, bool turnOffScreen) { displayBuffer(mode, turnOffScreen); }
 
 void FreeInkDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) {

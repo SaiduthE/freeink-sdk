@@ -13,9 +13,56 @@
 
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "soc/soc_caps.h"
+
+// DMA bulk write. Arduino's SPIClass is FIFO-polled: writeBytes() refills the
+// 64-byte FIFO and spins, so the CPU cannot build the next row while one is on
+// the wire, and every row's combine (base+LSB+MSB -> 4bpp, ~100 ms a grey page)
+// or bit-reverse adds straight onto the ~526 ms of wire time. With this on, the
+// image burst is handed to an ESP-IDF spi_master device on the OTHER SPI host,
+// fed from DMA-capable internal buffers: chunk N+1 is built while chunk N is
+// on the wire. Commands, register reads and HRDY-paced words stay on the
+// Arduino bus; only the SCLK/MOSI pads move to the DMA host for the length of
+// a burst (GPIO-matrix output select, two register writes each way), under
+// the Arduino bus lock (beginTransaction) and with CS held low by this driver.
+// -DIT8951_DMA_LOAD=0 compiles the polled path only; at runtime, a failed
+// setup or any DMA error leaves the driver on the polled path.
+#ifndef IT8951_DMA_LOAD
+#define IT8951_DMA_LOAD 1
+#endif
+#if IT8951_DMA_LOAD && SOC_SPI_PERIPH_NUM >= 3
+#define IT8951_DMA_ENABLED 1
+#include <driver/spi_master.h>
+#include <esp_rom_gpio.h>
+#include <soc/spi_periph.h>
+#else
+#define IT8951_DMA_ENABLED 0
+#endif
 
 namespace freeink {
 namespace {
+#if IT8951_DMA_ENABLED
+// The global SPIClass `SPI` (what _spi refers to) is VSPI = SPI3_HOST on the
+// classic ESP32 (M5Paper) and FSPI = SPI2_HOST on the S3 (eMinimal). The DMA
+// device takes the other general-purpose host. A board whose SD card has its
+// own SPIClass(HSPI) -- BoardConfig sd.separateSpi -- already owns that host,
+// so the DMA path stays off there (initDmaLoad checks).
+#if CONFIG_IDF_TARGET_ESP32
+constexpr spi_host_device_t ARDUINO_SPI_HOST = SPI3_HOST;
+constexpr spi_host_device_t DMA_SPI_HOST = SPI2_HOST;
+#else
+constexpr spi_host_device_t ARDUINO_SPI_HOST = SPI2_HOST;
+constexpr spi_host_device_t DMA_SPI_HOST = SPI3_HOST;
+#endif
+// Bytes per DMA chunk (whole rows; at least one full 4bpp row). 2 KB is two
+// 936-byte rows on the 7.8" panel: 702 transactions a frame, each costing a
+// few us of ISR hand-off, ~5 ms in all, for 3 x 2 KB of internal RAM.
+constexpr uint16_t DMA_CHUNK_TARGET = 2048;
+// A chunk of 2 KB takes ~0.8 ms at 20 MHz; a second without a completion
+// means the peripheral is wedged.
+constexpr TickType_t DMA_TIMEOUT_TICKS = pdMS_TO_TICKS(1000);
+#endif
+
 // SPI preamble words (sent MSB-first before each command/data/read).
 constexpr uint16_t PRE_CMD = 0x6000;  // command write
 constexpr uint16_t PRE_WR = 0x0000;   // data write
@@ -76,6 +123,33 @@ struct BitReverseTable {
   }
 };
 constexpr BitReverseTable kBitRev;
+
+// A raw 4bpp byte (two pixels, first in the high nibble) -> those two pixels
+// in the driver's base/LSB/MSB plane terms, packed [5:4] base, [3:2] LSB,
+// [1:0] MSB, first pixel in the higher bit of each pair. The inverse of
+// gray4() on its four levels (0xF white -> base; 0xA light -> MSB; 0x5 dark ->
+// LSB; 0x0 black -> nothing), so loadImageGray() on the derived planes
+// reproduces a four-level frame exactly. Other levels: 0x8..0xE count as
+// light, 0x1..0x7 as dark -- what grayWithin() needs (any non-white,
+// non-black pixel sets a plane bit).
+struct Gray4PlaneTable {
+  uint8_t v[256];
+  constexpr Gray4PlaneTable() : v() {
+    for (unsigned i = 0; i < 256; i++) {
+      unsigned bits = 0;
+      for (unsigned p = 0; p < 2; p++) {
+        const unsigned n = p == 0 ? (i >> 4) : (i & 0x0F);
+        const unsigned s = 1 - p;
+        const unsigned white = n == 0x0F ? 1 : 0;
+        const unsigned msb = (!white && n >= 0x08) ? 1 : 0;
+        const unsigned lsb = (!white && n != 0 && n < 0x08) ? 1 : 0;
+        bits |= (white << (4 + s)) | (lsb << (2 + s)) | (msb << s);
+      }
+      v[i] = static_cast<uint8_t>(bits);
+    }
+  }
+};
+constexpr Gray4PlaneTable kGray4Planes;
 
 constexpr unsigned long READY_TIMEOUT_MS = 3000;
 
@@ -275,6 +349,187 @@ void It8951Driver::waitDisplayReady() {
   }
 }
 
+// --- bulk image write -------------------------------------------------------
+// HRDY is honoured where the driver has always honoured it: before the
+// PRE_WR preamble that opens the burst (and before every command/data word
+// around it). The rows themselves go out back to back in the one CS-low
+// frame with no HRDY check, polled or DMA -- the IT8951's load FIFO keeps up
+// at 20 MHz (bench, G2: 2.26 MB/s loaded = the no-load simulation, so HRDY
+// flow control during the burst costs nothing).
+template <typename Fill>
+void It8951Driver::streamImageRows(uint16_t numRows, uint16_t rowBytes, Fill&& fill) {
+  waitReady();
+  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
+  digitalWrite(_cs, LOW);
+  _spi.transfer16(PRE_WR);  // blocking: done on the wire before the pads move
+  uint16_t row = 0;         // first row not yet handed to the wire
+#if IT8951_DMA_ENABLED
+  if (_dmaDev && !_dmaFailed && rowBytes != 0 && rowBytes <= _dmaChunkBytes) {
+    const uint16_t perChunk = static_cast<uint16_t>(_dmaChunkBytes / rowBytes);
+    routeLoadPinsToDma(true);
+    uint8_t inFlight = 0;
+    uint8_t slot = 0;
+    bool ok = true;
+    while (row < numRows) {
+      // All buffers queued: wait for the oldest to leave the wire. The chunks
+      // behind it keep the bus busy while this one is refilled.
+      if (inFlight == DMA_BUFS) {
+        if (!retireDmaChunk()) {
+          ok = false;
+          break;
+        }
+        inFlight--;
+      }
+      const uint16_t left = static_cast<uint16_t>(numRows - row);
+      const uint16_t n = left < perChunk ? left : perChunk;
+      uint8_t* buf = _dmaBuf[slot];
+      for (uint16_t k = 0; k < n; k++) fill(static_cast<uint16_t>(row + k), buf + static_cast<uint32_t>(k) * rowBytes);
+      spi_transaction_t* t = &_dmaTrans[slot];
+      memset(t, 0, sizeof(*t));
+      t->length = static_cast<size_t>(n) * rowBytes * 8;  // bits
+      t->tx_buffer = buf;
+      if (spi_device_queue_trans(_dmaDev, t, DMA_TIMEOUT_TICKS) != ESP_OK) {
+        ok = false;
+        break;
+      }
+      inFlight++;
+      row = static_cast<uint16_t>(row + n);
+      slot = static_cast<uint8_t>((slot + 1) % DMA_BUFS);
+    }
+    // Drain: the burst is only over once the last chunk is off the wire.
+    while (inFlight > 0) {
+      if (!retireDmaChunk()) {
+        ok = false;
+        break;
+      }
+      inFlight--;
+    }
+    routeLoadPinsToDma(false);
+    if (!ok) {
+      // Only a wedged peripheral gets here (a queue slot is always free and a
+      // chunk takes < 1 ms). Finish this burst polled from the first unqueued
+      // row -- the frame may be off by a chunk if one was cut mid-flight; the
+      // next load is clean -- and stay polled from now on.
+      _dmaFailed = true;
+      if (Serial) Serial.printf("[it8951] DMA bulk write failed at row %u of %u; polled SPI from now on\n", row, numRows);
+    }
+  }
+#endif
+  for (; row < numRows; row++) {
+    fill(row, _rowBuf);
+    _spi.writeBytes(_rowBuf, rowBytes);
+  }
+  digitalWrite(_cs, HIGH);
+  _spi.endTransaction();
+}
+
+bool It8951Driver::retireDmaChunk() {
+#if IT8951_DMA_ENABLED
+  spi_transaction_t* done = nullptr;
+  return spi_device_get_trans_result(_dmaDev, &done, DMA_TIMEOUT_TICKS) == ESP_OK;
+#else
+  return false;
+#endif
+}
+
+// The SCLK/MOSI pads are GPIO-matrix outputs; each selects one peripheral
+// signal. Point them at the DMA host for a burst and back at the Arduino
+// bus's signals (what spiAttachSCK/MOSI programmed) after it. Both hosts idle
+// with SCLK low in mode 0 and nothing is clocked across the switch; MISO is
+// input-only and stays on the Arduino bus throughout.
+void It8951Driver::routeLoadPinsToDma(bool toDma) {
+#if IT8951_DMA_ENABLED
+  const spi_host_device_t host = toDma ? DMA_SPI_HOST : ARDUINO_SPI_HOST;
+  esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(_sclk), spi_periph_signal[host].spiclk_out, false, false);
+  esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(_mosi), spi_periph_signal[host].spid_out, false, false);
+#else
+  (void)toDma;
+#endif
+}
+
+// Bring up the DMA device once (begin()). Any failure leaves _dmaDev null and
+// every load on the polled path.
+void It8951Driver::initDmaLoad() {
+#if IT8951_DMA_ENABLED
+  if (_dmaDev || _dmaFailed) return;
+  if (_sclk < 0 || _mosi < 0 || _cs < 0) return;
+  if (BoardConfig::ACTIVE.sd.separateSpi) return;  // the SD card owns the other host (see DMA_SPI_HOST)
+  const uint32_t fullRow = static_cast<uint32_t>(_fbWb) * 4;  // widest row any load sends
+  uint32_t chunk = fullRow > DMA_CHUNK_TARGET ? fullRow : DMA_CHUNK_TARGET;
+  chunk = (chunk + 3) & ~3u;
+  if (chunk > 0xFFFF) return;
+  auto release = [this]() {
+    for (auto& b : _dmaBuf) {
+      if (b) heap_caps_free(b);
+      b = nullptr;
+    }
+    if (_dmaTrans) heap_caps_free(_dmaTrans);
+    _dmaTrans = nullptr;
+  };
+  // DMA reads these: internal, DMA-capable RAM (never PSRAM). Word-aligned so
+  // spi_master sends them in place instead of bouncing through a copy.
+  for (auto& b : _dmaBuf) {
+    b = static_cast<uint8_t*>(heap_caps_aligned_alloc(4, chunk, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!b) {
+      release();
+      return;
+    }
+  }
+  _dmaTrans = static_cast<spi_transaction_t*>(
+      heap_caps_calloc(DMA_BUFS, sizeof(spi_transaction_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (!_dmaTrans) {
+    release();
+    return;
+  }
+
+  spi_bus_config_t bus = {};
+  bus.mosi_io_num = _mosi;
+  bus.miso_io_num = -1;  // write-only; MISO stays on the Arduino bus
+  bus.sclk_io_num = _sclk;
+  bus.quadwp_io_num = -1;
+  bus.quadhd_io_num = -1;
+  bus.data4_io_num = -1;
+  bus.data5_io_num = -1;
+  bus.data6_io_num = -1;
+  bus.data7_io_num = -1;
+  bus.max_transfer_sz = static_cast<int>(chunk);
+  // GPIO matrix, never the IOMUX: the pads must stay switchable between hosts.
+  bus.flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS;
+  esp_err_t err = spi_bus_initialize(DMA_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
+  if (err != ESP_OK) {
+    routeLoadPinsToDma(false);  // whatever the failed init touched, give the pads back
+    release();
+    if (Serial) Serial.printf("[it8951] DMA bulk write unavailable (bus init %d); polled SPI\n", static_cast<int>(err));
+    return;
+  }
+  spi_device_interface_config_t dev = {};
+  dev.mode = 0;
+  dev.clock_speed_hz = static_cast<int>(loadClockHz());
+  dev.spics_io_num = -1;  // CS is this driver's GPIO, low for the whole burst
+  dev.queue_size = DMA_BUFS;
+  dev.flags = SPI_DEVICE_HALFDUPLEX;  // TX only
+  spi_device_handle_t handle = nullptr;
+  err = spi_bus_add_device(DMA_SPI_HOST, &dev, &handle);
+  // spi_bus_initialize routed the pads to the DMA host: hand them back to the
+  // Arduino bus until the first burst.
+  routeLoadPinsToDma(false);
+  if (err != ESP_OK) {
+    spi_bus_free(DMA_SPI_HOST);
+    release();
+    if (Serial) Serial.printf("[it8951] DMA bulk write unavailable (add device %d); polled SPI\n", static_cast<int>(err));
+    return;
+  }
+  _dmaDev = handle;
+  _dmaChunkBytes = static_cast<uint16_t>(chunk);
+#ifdef IT8951_TIMING_LOG
+  if (Serial)
+    Serial.printf("[it8951] bulk write via DMA: SPI host %d, %u x %lu B chunks, %lu Hz\n", static_cast<int>(DMA_SPI_HOST),
+                  static_cast<unsigned>(DMA_BUFS), static_cast<unsigned long>(chunk),
+                  static_cast<unsigned long>(loadClockHz()));
+#endif
+#endif
+}
+
 // Expand the 1bpp landscape framebuffer to the IT8951's 4bpp packing and stream it
 // into controller SRAM. White bit (1) -> 0xF, black bit (0) -> 0x0; two pixels per
 // byte, leftmost pixel in the high nibble. The whole image rides one CS-low burst
@@ -322,16 +577,11 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
   writeData(static_cast<uint16_t>(widthBytes * 8));  // w
   writeData(static_cast<uint16_t>(y1 - y0 + 1));     // h
 
-  uint8_t* rowBuf = _rowBuf;  // _fbW / 2 bytes, allocated in begin()
   // 4bpp: 2 px per byte, a framebuffer byte becomes 4; 2bpp: 4 px per byte, 2.
   const uint16_t rowOutBytes = static_cast<uint16_t>(widthBytes * (twoBpp ? 2 : 4));
 
-  waitReady();
-  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_WR);
-  for (uint16_t y = y0; y <= y1; y++) {
-    const uint8_t* src = fb + static_cast<uint32_t>(y) * _fbWb + xb0;
+  streamImageRows(static_cast<uint16_t>(y1 - y0 + 1), rowOutBytes, [&](uint16_t i, uint8_t* rowBuf) {
+    const uint8_t* src = fb + static_cast<uint32_t>(y0 + i) * _fbWb + xb0;
     uint16_t o = 0;
     if (twoBpp) {
       // Spread each 1-bit pixel to 2 bits (1 -> 11 white, 0 -> 00 black),
@@ -352,10 +602,7 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
         rowBuf[o++] = static_cast<uint8_t>(((b & 0x02) ? 0xF0 : 0x00) | ((b & 0x01) ? 0x0F : 0x00));
       }
     }
-    _spi.writeBytes(rowBuf, rowOutBytes);
-  }
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  });
 
   writeCommand(CMD_LD_IMG_END);
   _memBitmap = false;
@@ -411,23 +658,16 @@ void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) 
   if (Serial) Serial.printf("[it8951] bitmap load rows %u..%u (%u B/row)\n", y0, y1, _fbWb);
 #endif
 
-  uint8_t* rowBuf = _rowBuf;  // needs _fbWb bytes; allocated as _fbWb * 4
-  waitReady();
-  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_WR);
-  for (uint16_t y = y0; y <= y1; y++) {
-    const uint8_t* src = fb + static_cast<uint32_t>(y) * _fbWb;
+  // Rows need _fbWb bytes (the row buffers hold _fbWb * 4). The per-row bit
+  // reverse is the transform the DMA path hides behind the wire.
+  streamImageRows(static_cast<uint16_t>(y1 - y0 + 1), _fbWb, [&](uint16_t i, uint8_t* rowBuf) {
+    const uint8_t* src = fb + static_cast<uint32_t>(y0 + i) * _fbWb;
     if (BITMAP_LSB_FIRST) {
       for (uint16_t xb = 0; xb < _fbWb; xb++) rowBuf[xb] = kBitRev.v[src[xb]];
-      _spi.writeBytes(rowBuf, _fbWb);
     } else {
-      memcpy(rowBuf, src, _fbWb);  // PSRAM -> internal RAM for the SPI FIFO
-      _spi.writeBytes(rowBuf, _fbWb);
+      memcpy(rowBuf, src, _fbWb);  // PSRAM -> internal RAM for the SPI FIFO / DMA
     }
-  }
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  });
 
   writeCommand(CMD_LD_IMG_END);
   _memBitmap = true;
@@ -507,15 +747,12 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   writeData(_fbH);  // h
 
   const bool haveGray = _gLsb && _gMsb;
-  uint8_t* rowBuf = _rowBuf;  // _fbW / 2 bytes, allocated in begin()
   const uint16_t maxXb = _fbWb;
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * (twoBpp ? 2 : 4));
 
-  waitReady();
-  _spi.beginTransaction(SPISettings(loadClockHz(), MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_WR);
-  for (uint16_t y = 0; y < _fbH; y++) {
+  // The combine (~70 us a row from PSRAM) is what the DMA path overlaps with
+  // the previous chunk's ~375 us on the wire.
+  streamImageRows(_fbH, rowOutBytes, [&](uint16_t y, uint8_t* rowBuf) {
     const uint32_t rowOff = static_cast<uint32_t>(y) * _fbWb;
     const uint8_t* brow = base + rowOff;
     const uint8_t* lrow = haveGray ? _gLsb + rowOff : nullptr;
@@ -554,10 +791,7 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
         rowBuf[o++] = static_cast<uint8_t>((gray4(bb, lb, mb, 0x02) << 4) | gray4(bb, lb, mb, 0x01));
       }
     }
-    _spi.writeBytes(rowBuf, rowOutBytes);
-  }
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  });
 
   writeCommand(CMD_LD_IMG_END);
   _memBitmap = false;  // whole frame, levels format
@@ -565,6 +799,65 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   _loadUs += micros() - tLoad;
   _loadBytes += static_cast<uint32_t>(_fbWb) * 4 * _fbH;
 #endif
+}
+
+// A host-built 4bpp frame: the same LD_IMG_AREA header, rotation and byte
+// stream as loadImageGray() (whole frame, image space _fbW x _fbH, 4bpp,
+// ENDIAN_BIG), but the bytes come ready-made. Rows are copied from the host
+// buffer (PSRAM) into the DMA/row buffer, and while each row is in internal
+// RAM its pixels are folded back into _base/_gLsb/_gMsb (see Gray4PlaneTable)
+// so the next display() can diff against the frame now in controller memory.
+// Always 4bpp on the wire, whatever _cfg.loadDepth says: the input is 4bpp.
+bool It8951Driver::loadImageGray4(const uint8_t* fb4) {
+  if (!_rowBuf || !fb4) return false;
+  if (!_running) {
+    systemRun();
+    _running = true;
+  }
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tLoad = micros();
+#endif
+  setTargetMemoryAddr(_imgBufAddr);
+
+  const uint16_t arg = static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_4 << 4) | (_rotation & 0x03));
+  writeCommand(CMD_LD_IMG_AREA);
+  writeData(arg);
+  writeData(0);     // x
+  writeData(0);     // y
+  writeData(_fbW);  // w (image space)
+  writeData(_fbH);  // h
+
+  const uint16_t rowBytes = static_cast<uint16_t>(_fbWb * 4);  // _fbW / 2
+  const bool derive = _base && _gLsb && _gMsb;
+  streamImageRows(_fbH, rowBytes, [&](uint16_t y, uint8_t* rowBuf) {
+    memcpy(rowBuf, fb4 + static_cast<uint32_t>(y) * rowBytes, rowBytes);
+    if (!derive) return;
+    const uint32_t off = static_cast<uint32_t>(y) * _fbWb;
+    uint8_t* b = _base + off;
+    uint8_t* l = _gLsb + off;
+    uint8_t* m = _gMsb + off;
+    const uint8_t* s = rowBuf;
+    // Four 2-pixel lookups -> one framebuffer byte (8 px, first pixel MSB) per plane.
+    auto pack = [](unsigned t0, unsigned t1, unsigned t2, unsigned t3, unsigned sh) {
+      return static_cast<uint8_t>((((t0 >> sh) & 3u) << 6) | (((t1 >> sh) & 3u) << 4) | (((t2 >> sh) & 3u) << 2) |
+                                  ((t3 >> sh) & 3u));
+    };
+    for (uint16_t xb = 0; xb < _fbWb; xb++, s += 4) {
+      const unsigned t0 = kGray4Planes.v[s[0]], t1 = kGray4Planes.v[s[1]];
+      const unsigned t2 = kGray4Planes.v[s[2]], t3 = kGray4Planes.v[s[3]];
+      b[xb] = pack(t0, t1, t2, t3, 4);
+      l[xb] = pack(t0, t1, t2, t3, 2);
+      m[xb] = pack(t0, t1, t2, t3, 0);
+    }
+  });
+
+  writeCommand(CMD_LD_IMG_END);
+  _memBitmap = false;  // whole frame, levels format
+#ifdef IT8951_TIMING_LOG
+  _loadUs += micros() - tLoad;
+  _loadBytes += static_cast<uint32_t>(rowBytes) * _fbH;
+#endif
+  return derive;
 }
 
 void It8951Driver::begin(EpdBus& bus) {
@@ -626,6 +919,9 @@ void It8951Driver::begin(EpdBus& bus) {
     _rowBuf = static_cast<uint8_t*>(heap_caps_malloc(rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!_rowBuf) _rowBuf = static_cast<uint8_t*>(malloc(rowBytes));
   }
+  // DMA bulk write on the second SPI host (no-op if already up, compiled out,
+  // or unavailable -- then every load stays on the polled path above).
+  initDmaLoad();
 
   waitReady();
   // SYS_RUN before anything else. deepSleep() leaves the controller in CMD_SLEEP,
@@ -975,6 +1271,54 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     writeCommand(CMD_STANDBY);
     _running = false;
   }
+}
+
+// A host-rendered 16-level frame: one load, one refresh, bookkept like a gray
+// page from displayGray() so the B/W display() that follows sees the memory
+// as it is:
+//  - a base staged by displayGrayscaleBase() is superseded (this frame is the
+//    page); its refresh request and turnOff carry over, the stronger mode wins;
+//  - the waveform is resolveMode(mode, grayMode): GC16 for Full/Half, the
+//    first paint, a wake from standby or the periodic clear, else DU4 --
+//    resolved before the load, so a wake from standby (!_running) clears, as
+//    display() does;
+//  - _base/_gLsb/_gMsb are re-derived from the frame, so _memMirrorsBase and
+//    _memHasGray hold and display()'s diff box, grayWithin() promotion and
+//    largeBox logic apply unchanged. Without those buffers, _memMirrorsBase is
+//    false and the next display() reloads the whole frame;
+//  - a DU4 frame joins the dirty region (whole frame); a GC16 one clears it.
+bool It8951Driver::displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mode, bool turnOff) {
+  (void)bus;
+  if (!fb4 || !_rowBuf) return false;
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tEntry = micros();
+  _loadUs = 0;
+  _loadBytes = 0;
+#endif
+  if (_baseStaged) {
+    if (mode == RefreshMode::Fast) mode = _stagedMode;
+    turnOff = turnOff || _stagedTurnOff;
+    _baseStaged = false;
+  }
+  const uint16_t gmode = resolveMode(mode, _cfg.grayMode);
+  const bool derived = loadImageGray4(fb4);
+  _memMirrorsBase = derived;
+  _memHasGray = derived;
+  displayArea(0, 0, _panelW, _panelH, gmode);
+  waitDisplayReady();
+#ifdef IT8951_TIMING_LOG
+  printTiming("displayGray4", tEntry, gmode);
+#endif
+  if (gmode == _cfg.fullMode) {
+    _dirtyValid = false;
+  } else {
+    dirtyUnion(0, static_cast<uint16_t>(_fbWb - 1), 0, static_cast<uint16_t>(_fbH - 1));
+  }
+  if (turnOff) {
+    writeCommand(CMD_STANDBY);
+    _running = false;
+  }
+  return true;
 }
 
 #ifdef IT8951_TIMING_LOG
