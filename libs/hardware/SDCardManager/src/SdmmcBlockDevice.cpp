@@ -16,7 +16,26 @@ namespace freeink {
 
 bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
   if (pins.busWidth == 0) return false;
+  _pins = pins;  // stashed so recover() can redo host/slot bring-up without the caller
 
+  // Keep one DMA-capable bounce buffer for all block I/O. SdFat's own cache may
+  // live in PSRAM / at an unaligned address, while native SDMMC requires an
+  // internal-RAM DMA buffer. Limiting each transfer to eight sectors keeps the
+  // buffer bounded at 4 KiB and avoids heap churn in the USB-MSC callbacks.
+  // Survives recover() reinit — only the host/card session is torn down there.
+  if (!_dmaBuffer) {
+    _dmaBuffer = static_cast<uint8_t*>(heap_caps_malloc(kSectorSize * kMaxTransferSectors,
+                                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    if (!_dmaBuffer) return false;
+  }
+
+  return mount();
+}
+
+// Host/slot/card bring-up. Shared by begin() (first mount, after _pins and
+// _dmaBuffer are set) and recover() (re-mount after a wedged card, using the
+// _pins begin() stashed and the _dmaBuffer already allocated).
+bool SdmmcBlockDevice::mount() {
   // Host config matches the OEM (recovered from app1's mountSD via Ghidra): full
   // default capability flags (0x37) with the actual width selected via slot.width
   // only, and the data clock at 40 MHz. The read timeouts we chased earlier were a
@@ -27,13 +46,13 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
   // Slot pin map. The ESP32-S3 routes SDMMC through the GPIO matrix, so the data
   // and clock/command lines are assignable (unlike the classic ESP32's fixed slot).
   sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-  slot.width = pins.busWidth;
-  slot.clk = static_cast<gpio_num_t>(pins.clk);
-  slot.cmd = static_cast<gpio_num_t>(pins.cmd);
-  slot.d0 = static_cast<gpio_num_t>(pins.d0);
-  slot.d1 = static_cast<gpio_num_t>(pins.d1);
-  slot.d2 = static_cast<gpio_num_t>(pins.d2);
-  slot.d3 = static_cast<gpio_num_t>(pins.d3);
+  slot.width = _pins.busWidth;
+  slot.clk = static_cast<gpio_num_t>(_pins.clk);
+  slot.cmd = static_cast<gpio_num_t>(_pins.cmd);
+  slot.d0 = static_cast<gpio_num_t>(_pins.d0);
+  slot.d1 = static_cast<gpio_num_t>(_pins.d1);
+  slot.d2 = static_cast<gpio_num_t>(_pins.d2);
+  slot.d3 = static_cast<gpio_num_t>(_pins.d3);
   slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
   if (sdmmc_host_init() != ESP_OK) return false;
@@ -53,7 +72,10 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
     sdmmc_host_deinit();
     return false;
   }
-  // SD power/enable pin (sd.powerEnable: GPIO5 on X4 Pro, GPIO6 on X4C).
+  // SD power/enable pin (sd.powerEnable: GPIO5 on X4 Pro, GPIO6 on X4C, GPIO21
+  // on e-Minimal — where the PNP high-side switch has been pulled off the bench
+  // unit, so this pin now drives nothing; the pulses below are harmless no-ops
+  // there and left as-is).
   // OEM mountSD pulses it
   // HIGH→LOW before each attempt and runs the card with the pin held LOW; it is an
   // active-LOW enable that gates the card's data path, not a one-shot rail. Confirmed
@@ -63,17 +85,6 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
   if (sdPwr >= 0) {
     gpio_hold_dis(static_cast<gpio_num_t>(sdPwr));
     pinMode(sdPwr, OUTPUT);
-  }
-  // Keep one DMA-capable bounce buffer for all block I/O. SdFat's own cache may
-  // live in PSRAM / at an unaligned address, while native SDMMC requires an
-  // internal-RAM DMA buffer. Limiting each transfer to eight sectors keeps the
-  // buffer bounded at 4 KiB and avoids heap churn in the USB-MSC callbacks.
-  _dmaBuffer = static_cast<uint8_t*>(heap_caps_malloc(kSectorSize * kMaxTransferSectors,
-                                                      MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
-  if (!_dmaBuffer) {
-    free(card);
-    sdmmc_host_deinit();
-    return false;
   }
 
   // Retry the WHOLE mount — init AND a real sector-0 read — power-cycling the
@@ -103,14 +114,60 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
   if (mountErr != ESP_OK) {
     if (Serial)
       Serial.printf("[%lu] [SD] SDMMC mount failed after retries: %s\n", millis(), esp_err_to_name(mountErr));
-    heap_caps_free(_dmaBuffer);
-    _dmaBuffer = nullptr;
     free(card);
     sdmmc_host_deinit();
     return false;
   }
   _card = card;
   return true;
+}
+
+// Recovery for a card that has wedged mid-session (e.g. a stray CRC error that
+// escalates into a run of read/write timeouts, sometimes seen right after a
+// CPU-frequency change — an in-flight SDMMC DMA transfer racing the switch is
+// the suspected trigger; see the report accompanying this change for detail).
+// Deinits the host + card session and re-mounts via mount(), reusing the pins and DMA
+// buffer already on hand. The FsVolume/FsFile layer above is untouched: _card
+// is swapped out from under the SAME SdmmcBlockDevice object SdFat already
+// holds a pointer to, so open file handles and the mounted volume survive —
+// they simply resume issuing sector I/O once mount() republishes _card.
+//
+// Rate-limited to kMaxRecoveriesPerWindow per kRecoveryWindowMs so a genuinely
+// dead/removed card doesn't retry (and power-cycle the gate) on every single
+// failing sector op. At most one recovery attempt is made per failing
+// readSectors()/writeSectors() call (see the recoveredThisOp guard there).
+bool SdmmcBlockDevice::recover(const char* opName, const int err) {
+  const uint32_t now = millis();
+  int recent = 0;
+  for (const uint32_t ts : _recoveryAttemptMs) {
+    if (ts != 0 && (now - ts) < kRecoveryWindowMs) recent++;
+  }
+  if (recent >= kMaxRecoveriesPerWindow) {
+    if (Serial)
+      Serial.printf("[%lu] [SD] recovery skipped (rate-limited, %d in the last minute) after %s error %s\n", now,
+                    recent, opName, esp_err_to_name(err));
+    return false;
+  }
+  _recoveryAttemptMs[_recoveryAttemptIdx] = now;
+  _recoveryAttemptIdx = (_recoveryAttemptIdx + 1) % kMaxRecoveriesPerWindow;
+
+  if (Serial)
+    Serial.printf("[%lu] [SD] %s error %s; reinitializing card\n", now, opName, esp_err_to_name(err));
+
+  if (_card) {
+    free(_card);
+    _card = nullptr;
+    sdmmc_host_deinit();
+  }
+
+  const bool ok = mount();
+  if (Serial) {
+    if (ok)
+      Serial.printf("[%lu] [SD] recovered card after %s\n", millis(), esp_err_to_name(err));
+    else
+      Serial.printf("[%lu] [SD] recovery failed\n", millis());
+  }
+  return ok;
 }
 
 void SdmmcBlockDevice::end() {
@@ -131,10 +188,19 @@ void SdmmcBlockDevice::end() {
 // through a DMA-capable buffer. (heap_caps_aligned_alloc via MALLOC_CAP_DMA.)
 bool SdmmcBlockDevice::readSectors(Sector_t sector, uint8_t* dst, size_t ns) {
   if (!_card || !_dmaBuffer || !dst || ns == 0) return false;
+  // At most one recover() per call, however many chunks the transfer takes —
+  // see the recover() comment for the rationale.
+  bool recoveredThisOp = false;
   while (ns > 0) {
     const size_t count = ns > kMaxTransferSectors ? kMaxTransferSectors : ns;
     const size_t bytes = count * kSectorSize;
-    if (sdmmc_read_sectors(static_cast<sdmmc_card_t*>(_card), _dmaBuffer, sector, count) != ESP_OK) return false;
+    esp_err_t err = sdmmc_read_sectors(static_cast<sdmmc_card_t*>(_card), _dmaBuffer, sector, count);
+    if (err != ESP_OK) {
+      if (recoveredThisOp || !recover("read", err)) return false;
+      recoveredThisOp = true;
+      // Retry the failed chunk once against the freshly re-mounted card.
+      if (sdmmc_read_sectors(static_cast<sdmmc_card_t*>(_card), _dmaBuffer, sector, count) != ESP_OK) return false;
+    }
     memcpy(dst, _dmaBuffer, bytes);
     sector += count;
     dst += bytes;
@@ -145,11 +211,21 @@ bool SdmmcBlockDevice::readSectors(Sector_t sector, uint8_t* dst, size_t ns) {
 
 bool SdmmcBlockDevice::writeSectors(Sector_t sector, const uint8_t* src, size_t ns) {
   if (!_card || !_dmaBuffer || !src || ns == 0) return false;
+  bool recoveredThisOp = false;
   while (ns > 0) {
     const size_t count = ns > kMaxTransferSectors ? kMaxTransferSectors : ns;
     const size_t bytes = count * kSectorSize;
     memcpy(_dmaBuffer, src, bytes);
-    if (sdmmc_write_sectors(static_cast<sdmmc_card_t*>(_card), _dmaBuffer, sector, count) != ESP_OK) return false;
+    esp_err_t err = sdmmc_write_sectors(static_cast<sdmmc_card_t*>(_card), _dmaBuffer, sector, count);
+    if (err != ESP_OK) {
+      if (recoveredThisOp || !recover("write", err)) return false;
+      recoveredThisOp = true;
+      // recover()'s mount() probes the freshly re-mounted card with a sector-0
+      // read into this same _dmaBuffer, clobbering the chunk we just staged —
+      // restage it before retrying the write.
+      memcpy(_dmaBuffer, src, bytes);
+      if (sdmmc_write_sectors(static_cast<sdmmc_card_t*>(_card), _dmaBuffer, sector, count) != ESP_OK) return false;
+    }
     sector += count;
     src += bytes;
     ns -= count;
