@@ -59,12 +59,15 @@ const It8951Config& eminimal78It8951Config() {
                  // 2bpp was tried 2026-09-18: the controller expands a 2-bit v to
                  // v<<2, not v*5 (datasheet fig. 7-16 -- the chip, not the firmware):
                  // white landed at 0xC, every page came up grey. Not an option.
-      20000000,  // loadSpiHz: the bulk image write at 20 MHz (80/4). G2 measured the
-                 // 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
+      26666667,  // loadSpiHz: the bulk image write at 26.67 MHz (80/3). G2 measured
+                 // the 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
                  // read failed there -- reads run out first on jumpers -- so only
                  // the write-only burst takes the fast clock; commands, reads and
-                 // HRDY-paced words stay on spiHz. Under test: a multi-second
-                 // freeze (HRDY stall) means back to 0 = spiHz. Re-sweep on a PCB.
+                 // HRDY-paced words stay on spiHz. Under test since 2026-09-24
+                 // (was 20000000, 80/4): speckle or shifted rows on a grey page, or
+                 // a multi-second freeze (HRDY stall), mean back to 20000000. The
+                 // S3 rounds a request DOWN to 80/N, so 80/3 must be asked for as
+                 // 26666667 -- 26666666 lands on 20 MHz. Re-sweep on a PCB.
   };
   return cfg;
 }
