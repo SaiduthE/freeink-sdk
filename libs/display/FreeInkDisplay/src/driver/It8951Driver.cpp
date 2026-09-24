@@ -440,8 +440,10 @@ void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) 
 // Row-by-row memcmp against the snapshot, then the first and last differing byte
 // of each differing row. ~330 KB read from each buffer, a few tens of ms from
 // PSRAM -- small next to the 1.1 s push it saves when the box is a menu band.
-bool It8951Driver::diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1) const {
+bool It8951Driver::diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1,
+                           uint32_t& changedBytes) const {
   bool any = false;
+  changedBytes = 0;
   for (uint16_t y = 0; y < _fbH; y++) {
     const uint8_t* a = fb + static_cast<uint32_t>(y) * _fbWb;
     const uint8_t* b = _base + static_cast<uint32_t>(y) * _fbWb;
@@ -450,6 +452,7 @@ bool It8951Driver::diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint
     while (a[lo] == b[lo]) lo++;
     uint16_t hi = static_cast<uint16_t>(_fbWb - 1);
     while (a[hi] == b[hi]) hi--;
+    changedBytes += static_cast<uint32_t>(hi - lo + 1);
     if (!any) {
       any = true;
       y0 = y;
@@ -758,15 +761,21 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   // coordinates and DPY_AREA takes panel ones). An empty box means the memory
   // is already right.
   uint16_t xb0 = 0, xb1 = 0, y0 = 0, y1 = 0;
+  uint32_t changedBytes = 0;
   const bool canDiff = _memMirrorsBase && _base && fb && _rotation == 0 && _panelW == _fbW && _panelH == _fbH;
-  const bool haveBox = canDiff && diffBox(fb, xb0, xb1, y0, y1);
+  const bool haveBox = canDiff && diffBox(fb, xb0, xb1, y0, y1, changedBytes);
   const bool unchanged = canDiff && !haveBox;
   const bool wholeFrame = !haveBox || (xb0 == 0 && xb1 == _fbWb - 1 && y0 == 0 && y1 == _fbH - 1);
-  bool largeBox = wholeFrame;
-  if (haveBox && !wholeFrame) {
-    const uint32_t boxArea = static_cast<uint32_t>(xb1 - xb0 + 1) * (y1 - y0 + 1);
-    largeBox = boxArea * 2 >= static_cast<uint32_t>(_fbWb) * _fbH;
-  }
+  // "Large" (a screen change) is judged on the area that actually changed, not
+  // the bounding box: one diff box spans every change, so a highlight leaving
+  // the top of the screen and one arriving lower down (Home's cover row to its
+  // menu row), or a highlight plus a footer hint whose label changed (Settings'
+  // tab band <-> rows, the "Select" row in a "Toggle" list), made a box over
+  // most of the frame -- read as a screen change, and with menu moves behind it
+  // (dirty) a full-panel GC16 flash on an ordinary cursor move. It also cost a
+  // whole frame toward the periodic clear, so every eighth such move flashed.
+  bool largeBox = !haveBox;
+  if (haveBox) largeBox = changedBytes * 2 >= static_cast<uint32_t>(_fbWb) * _fbH;
   // Gray under the box: DU is a two-level waveform, and driving anti-aliased
   // text to white with it leaves a shadow of every glyph -- what "back to Home
   // from a book" looked like. The planes are still buffered, so this is known
@@ -831,6 +840,8 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
       loadImageFull(fb);
       displayArea(0, 0, _panelW, _panelH, dpyMode);
       _memHasGray = false;
+      // Corner-to-corner box but little changed: a partial move like any other.
+      if (haveBox && !largeBox) dirtyUnion(xb0, xb1, y0, y1);
     }
   } else if (canDiff && !requestedClear) {
     // A clear with the memory already right outside the box: load the box and
