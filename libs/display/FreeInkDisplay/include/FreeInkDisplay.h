@@ -271,6 +271,19 @@ class FreeInkDisplay {
   void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
   void displayGrayCalibration(uint16_t customX, uint16_t customY, uint16_t customW, uint16_t customH);
 
+  // Raw 16-level frames (IT8951 only). displayGray4() loads a finished 4bpp
+  // frame and refreshes it as a grayscale page, in place of the B/W base +
+  // LSB/MSB plane pass. Layout: getDisplayWidth() x getDisplayHeight() in the
+  // framebuffer's own (landscape, pre-rotation) orientation, packed rows of
+  // gray4BufferSize() / getDisplayHeight() = getDisplayWidthBytes() * 4 bytes,
+  // left pixel in the high nibble, 0x0 black .. 0xF white; any memory, read
+  // only, not retained. See PanelDriver::displayGray4. Not available while
+  // output is inverted (like every grayscale path); false = nothing was done,
+  // use the plane path. The live framebuffer is left untouched.
+  bool supportsGray4() const;
+  uint32_t gray4BufferSize() const { return static_cast<uint32_t>(displayWidthBytes) * 4 * displayHeight; }
+  bool displayGray4(const uint8_t* fb4, RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
+
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
 
   // Hint the X3 policy to run a one-shot full resync on next update.
