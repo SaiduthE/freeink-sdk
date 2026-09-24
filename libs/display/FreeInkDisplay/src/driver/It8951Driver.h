@@ -107,8 +107,11 @@ class It8951Driver : public PanelDriver {
   // keeps its registers across a host reset).
   void setBitmapMode(bool on, bool force = false);
   // Bounding box of the bytes that differ between fb and _base, in the units
-  // loadImageArea() takes. False when nothing differs.
-  bool diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1) const;
+  // loadImageArea() takes. False when nothing differs. `changedBytes` is the
+  // area that actually changed (each differing row's first-to-last differing
+  // byte, summed) -- small for two far-apart highlights whose box is huge.
+  bool diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1,
+               uint32_t& changedBytes) const;
   void loadImageGray(const uint8_t* base);  // combine base + LSB/MSB planes -> 4bpp into controller SRAM
   void displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode);
   void waitDisplayReady();                // poll LUT-busy register
