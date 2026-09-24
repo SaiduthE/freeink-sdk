@@ -370,6 +370,8 @@ void It8951Driver::streamImageRows(uint16_t numRows, uint16_t rowBytes, Fill&& f
     uint8_t inFlight = 0;
     uint8_t slot = 0;
     bool ok = true;
+    uint8_t* unsent = nullptr;  // a chunk built but never queued (queue failure)
+    uint16_t unsentRows = 0;
     while (row < numRows) {
       // All buffers queued: wait for the oldest to leave the wire. The chunks
       // behind it keep the bus busy while this one is refilled.
@@ -389,6 +391,8 @@ void It8951Driver::streamImageRows(uint16_t numRows, uint16_t rowBytes, Fill&& f
       t->length = static_cast<size_t>(n) * rowBytes * 8;  // bits
       t->tx_buffer = buf;
       if (spi_device_queue_trans(_dmaDev, t, DMA_TIMEOUT_TICKS) != ESP_OK) {
+        unsent = buf;
+        unsentRows = n;
         ok = false;
         break;
       }
@@ -409,9 +413,15 @@ void It8951Driver::streamImageRows(uint16_t numRows, uint16_t rowBytes, Fill&& f
       // Only a wedged peripheral gets here (a queue slot is always free and a
       // chunk takes < 1 ms). Finish this burst polled from the first unqueued
       // row -- the frame may be off by a chunk if one was cut mid-flight; the
-      // next load is clean -- and stay polled from now on.
+      // next load is clean -- and stay polled from now on. A chunk built but
+      // never queued goes out as it is: fill() has run for its rows already,
+      // and is asked for every row exactly once.
       _dmaFailed = true;
       if (Serial) Serial.printf("[it8951] DMA bulk write failed at row %u of %u; polled SPI from now on\n", row, numRows);
+      if (unsent) {
+        _spi.writeBytes(unsent, static_cast<uint32_t>(unsentRows) * rowBytes);
+        row = static_cast<uint16_t>(row + unsentRows);
+      }
     }
   }
 #endif
@@ -807,13 +817,18 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
 
 // A host-built 4bpp frame: the same LD_IMG_AREA header, rotation and byte
 // stream as loadImageGray() (whole frame, image space _fbW x _fbH, 4bpp,
-// ENDIAN_BIG), but the bytes come ready-made. Rows are copied from the host
-// buffer (PSRAM) into the DMA/row buffer, and while each row is in internal
-// RAM its pixels are folded back into _base/_gLsb/_gMsb (see Gray4PlaneTable)
-// so the next display() can diff against the frame now in controller memory.
-// Always 4bpp on the wire, whatever _cfg.loadDepth says: the input is 4bpp.
-bool It8951Driver::loadImageGray4(const uint8_t* fb4) {
-  if (!_rowBuf || !fb4) return false;
+// ENDIAN_BIG), but the bytes come ready-made: `fill` builds each row straight
+// in the DMA/row buffer (the facade's displayGray4: a memcpy out of the host's
+// PSRAM frame; displayGray4Rows: whatever the host composes). While the row is
+// in internal RAM its pixels are folded back into _base/_gLsb/_gMsb (see
+// Gray4PlaneTable) so the next display() can diff against the frame now in
+// controller memory, and the base row is copied out to `baseOut` when the host
+// asked for it. Without planes of our own (their PSRAM allocation failed) the
+// base row is still derived, into baseOut alone: the host's copy never depends
+// on ours. Always 4bpp on the wire, whatever _cfg.loadDepth says: the input is
+// 4bpp.
+bool It8951Driver::loadImageGray4(Gray4RowFill fill, void* ctx, uint8_t* baseOut) {
+  if (!_rowBuf || !fill) return false;
   if (!_running) {
     systemRun();
     _running = true;
@@ -834,18 +849,26 @@ bool It8951Driver::loadImageGray4(const uint8_t* fb4) {
   const uint16_t rowBytes = static_cast<uint16_t>(_fbWb * 4);  // _fbW / 2
   const bool derive = _base && _gLsb && _gMsb;
   streamImageRows(_fbH, rowBytes, [&](uint16_t y, uint8_t* rowBuf) {
-    memcpy(rowBuf, fb4 + static_cast<uint32_t>(y) * rowBytes, rowBytes);
-    if (!derive) return;
+    fill(ctx, y, rowBuf);
+    if (!derive && !baseOut) return;
     const uint32_t off = static_cast<uint32_t>(y) * _fbWb;
-    uint8_t* b = _base + off;
-    uint8_t* l = _gLsb + off;
-    uint8_t* m = _gMsb + off;
     const uint8_t* s = rowBuf;
     // Four 2-pixel lookups -> one framebuffer byte (8 px, first pixel MSB) per plane.
     auto pack = [](unsigned t0, unsigned t1, unsigned t2, unsigned t3, unsigned sh) {
       return static_cast<uint8_t>((((t0 >> sh) & 3u) << 6) | (((t1 >> sh) & 3u) << 4) | (((t2 >> sh) & 3u) << 2) |
                                   ((t3 >> sh) & 3u));
     };
+    if (!derive) {
+      // No planes of our own: the host's base only.
+      uint8_t* b = baseOut + off;
+      for (uint16_t xb = 0; xb < _fbWb; xb++, s += 4) {
+        b[xb] = pack(kGray4Planes.v[s[0]], kGray4Planes.v[s[1]], kGray4Planes.v[s[2]], kGray4Planes.v[s[3]], 4);
+      }
+      return;
+    }
+    uint8_t* b = _base + off;
+    uint8_t* l = _gLsb + off;
+    uint8_t* m = _gMsb + off;
     for (uint16_t xb = 0; xb < _fbWb; xb++, s += 4) {
       const unsigned t0 = kGray4Planes.v[s[0]], t1 = kGray4Planes.v[s[1]];
       const unsigned t2 = kGray4Planes.v[s[2]], t3 = kGray4Planes.v[s[3]];
@@ -853,6 +876,7 @@ bool It8951Driver::loadImageGray4(const uint8_t* fb4) {
       l[xb] = pack(t0, t1, t2, t3, 2);
       m[xb] = pack(t0, t1, t2, t3, 0);
     }
+    if (baseOut) memcpy(baseOut + off, b, _fbWb);
   });
 
   writeCommand(CMD_LD_IMG_END);
@@ -918,10 +942,12 @@ void It8951Driver::begin(EpdBus& bus) {
   if (!_base) _base = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
   // One 4bpp row for the load loops, sized to this panel (936 B on 1872 px,
   // 480 B on M5Paper's 960). Internal RAM: SPI writeBytes reads it every row.
+  // Word-aligned like the DMA chunks: a displayGray4Rows fill may store whole
+  // words into the row it is handed.
   if (!_rowBuf) {
     const size_t rowBytes = static_cast<size_t>(_fbWb) * 4;
-    _rowBuf = static_cast<uint8_t*>(heap_caps_malloc(rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (!_rowBuf) _rowBuf = static_cast<uint8_t*>(malloc(rowBytes));
+    _rowBuf = static_cast<uint8_t*>(heap_caps_aligned_alloc(4, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!_rowBuf) _rowBuf = static_cast<uint8_t*>(malloc(rowBytes));  // word-aligned as well
   }
   // DMA bulk write on the second SPI host (no-op if already up, compiled out,
   // or unavailable -- then every load stays on the polled path above).
@@ -1277,23 +1303,25 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   }
 }
 
-// A host-rendered 16-level frame: one load, one refresh, bookkept like a gray
-// page from displayGray() so the B/W display() that follows sees the memory
-// as it is:
+// A host-rendered 16-level frame, a row at a time from `fill`: one load, one
+// refresh, bookkept like a gray page from displayGray() so the B/W display()
+// that follows sees the memory as it is:
 //  - a base staged by displayGrayscaleBase() is superseded (this frame is the
 //    page); its refresh request and turnOff carry over, the stronger mode wins;
 //  - the waveform is resolveMode(mode, grayMode): GC16 for Full/Half, the
 //    first paint, a wake from standby or the periodic clear, else DU4 --
 //    resolved before the load, so a wake from standby (!_running) clears, as
 //    display() does;
-//  - _base/_gLsb/_gMsb are re-derived from the frame, so _memMirrorsBase and
+//  - _base/_gLsb/_gMsb are re-derived from the rows, so _memMirrorsBase and
 //    _memHasGray hold and display()'s diff box, grayWithin() promotion and
 //    largeBox logic apply unchanged. Without those buffers, _memMirrorsBase is
-//    false and the next display() reloads the whole frame;
+//    false and the next display() reloads the whole frame. The host gets the
+//    same base in `baseOut` either way;
 //  - a DU4 frame joins the dirty region (whole frame); a GC16 one clears it.
-bool It8951Driver::displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mode, bool turnOff) {
+bool It8951Driver::displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, RefreshMode mode, bool turnOff,
+                                    uint8_t* baseOut) {
   (void)bus;
-  if (!fb4 || !_rowBuf) return false;
+  if (!fill || !_rowBuf) return false;
 #ifdef IT8951_TIMING_LOG
   const uint32_t tEntry = micros();
   _loadUs = 0;
@@ -1305,7 +1333,7 @@ bool It8951Driver::displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mod
     _baseStaged = false;
   }
   const uint16_t gmode = resolveMode(mode, _cfg.grayMode);
-  const bool derived = loadImageGray4(fb4);
+  const bool derived = loadImageGray4(fill, ctx, baseOut);
   _memMirrorsBase = derived;
   _memHasGray = derived;
   displayArea(0, 0, _panelW, _panelH, gmode);

@@ -68,13 +68,17 @@ class It8951Driver : public PanelDriver {
   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
 
-  // --- raw 16-level frames (see PanelDriver::displayGray4 for the layout) ---
+  // --- raw 16-level frames (see PanelDriver::displayGray4Rows for the layout) ---
   // One whole-frame 4bpp load + one refresh, with the gray-page bookkeeping of
   // displayGray(): the grey mode on the ghost-clear cadence, a staged base
-  // consumed, and _base/_gLsb/_gMsb re-derived from the frame so display()'s
+  // consumed, and _base/_gLsb/_gMsb re-derived from the rows so display()'s
   // diff, grayWithin() and the dirty region keep working on the next B/W frame.
-  bool supportsGray4() const override { return true; }
-  bool displayGray4(EpdBus& bus, const uint8_t* fb4, RefreshMode mode, bool turnOff) override;
+  // The row buffer is all a load needs (begin() allocates it), so this is true
+  // on every running IT8951 and displayGray4Rows() refuses exactly when it is
+  // false; the DMA path being down only means the polled burst.
+  bool supportsGray4() const override { return _rowBuf != nullptr; }
+  bool displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, RefreshMode mode, bool turnOff,
+                        uint8_t* baseOut) override;
 
  private:
   // --- low-level SPI framing ---
@@ -126,9 +130,11 @@ class It8951Driver : public PanelDriver {
   bool diffBox(const uint8_t* fb, uint16_t& xb0, uint16_t& xb1, uint16_t& y0, uint16_t& y1,
                uint32_t& changedBytes) const;
   void loadImageGray(const uint8_t* base);  // combine base + LSB/MSB planes -> 4bpp into controller SRAM
-  // A host-built 4bpp frame straight into controller SRAM (displayGray4). Also
-  // rewrites _base/_gLsb/_gMsb to describe it; returns whether it could.
-  bool loadImageGray4(const uint8_t* fb4);
+  // A host-built 4bpp frame straight into controller SRAM (displayGray4Rows),
+  // one row at a time from `fill`. Also rewrites _base/_gLsb/_gMsb to describe
+  // it (returns whether it could) and, when `baseOut` is given, writes the
+  // derived 1bpp base there as well -- planes or not.
+  bool loadImageGray4(Gray4RowFill fill, void* ctx, uint8_t* baseOut);
   // The one bulk-write burst every load goes through: HRDY, CS low, PRE_WR,
   // then numRows rows of rowBytes, each produced by fill(rowIndex, dst), then
   // CS high. With the DMA path up, rows are built in chunks into DMA buffers
