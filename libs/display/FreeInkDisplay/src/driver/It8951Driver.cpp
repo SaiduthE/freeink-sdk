@@ -522,10 +522,14 @@ void It8951Driver::initDmaLoad() {
   _dmaDev = handle;
   _dmaChunkBytes = static_cast<uint16_t>(chunk);
 #ifdef IT8951_TIMING_LOG
+  // The clock the host really set: requests round to an 80/N rung, so this is
+  // what a loadSpiHz change actually bought.
+  int actualKhz = 0;
+  spi_device_get_actual_freq(handle, &actualKhz);
   if (Serial)
-    Serial.printf("[it8951] bulk write via DMA: SPI host %d, %u x %lu B chunks, %lu Hz\n", static_cast<int>(DMA_SPI_HOST),
-                  static_cast<unsigned>(DMA_BUFS), static_cast<unsigned long>(chunk),
-                  static_cast<unsigned long>(loadClockHz()));
+    Serial.printf("[it8951] bulk write via DMA: SPI host %d, %u x %lu B chunks, %lu Hz asked, %d kHz actual\n",
+                  static_cast<int>(DMA_SPI_HOST), static_cast<unsigned>(DMA_BUFS), static_cast<unsigned long>(chunk),
+                  static_cast<unsigned long>(loadClockHz()), actualKhz);
 #endif
 #endif
 }
