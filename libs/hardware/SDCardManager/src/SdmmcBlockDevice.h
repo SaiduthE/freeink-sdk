@@ -70,6 +70,9 @@ class SdmmcBlockDevice : public FsBlockDeviceInterface {
   // kMaxRecoveriesPerWindow per kRecoveryWindowMs; logs
   // "[SD] recovered card after <err>" or "[SD] recovery failed".
   bool recover(const char* opName, int err);
+  // True when a card session exists, re-mounting (rate-limited) when an earlier
+  // recover() failed and left none.
+  bool ensureCard(const char* opName, bool& recoveredThisOp);
 };
 
 }  // namespace freeink
