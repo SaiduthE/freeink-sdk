@@ -1368,8 +1368,11 @@ constexpr BoardProfile EMINIMAL_78 = {
     1404,  // the reading UI is portrait and rotates onto it, as M5Paper does
     // sclk, mosi, cs, dc, rst, busy(HRDY), powerEnable.
     // No DC: the IT8951's 16-bit preamble carries the command/data distinction.
-    // No RST: M5Paper leaves it unassigned too; wire it only if hard recovery needs it.
-    {14, 16, 18, PIN_UNASSIGNED, PIN_UNASSIGNED, 38, 39},
+    // RST on 40 (active low, pulled up on the HAT): the controller keeps its
+    // state across every host reset, and one that powers up wedged holds HRDY
+    // low until its own reset, so It8951Driver::begin() pulses it on every boot.
+    // The sleep path holds it LOW through deep sleep (powerEnable is assigned).
+    {14, 16, 18, PIN_UNASSIGNED, 40, 38, 39},
     0,  // displaySpiHz: unused by It8951Driver, which owns its SPI and takes the
         // clock from It8951Config.spiHz (10 MHz, swept at G2).
     // SdPins bus entries unused — the card is on SDMMC below; kept unassigned so

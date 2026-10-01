@@ -178,8 +178,11 @@ class It8951Driver : public PanelDriver {
   uint16_t _fbH;   // landscape framebuffer height (540)
   uint16_t _fbWb;  // framebuffer width bytes (120)
 
+  // Hardware reset through the board's display.rst, when it has one (begin()).
+  void resetController();
+
   // Resolved at begin().
-  int8_t _sclk = -1, _mosi = -1, _miso = -1, _cs = -1, _busy = -1, _pwrEn = -1, _sdCs = -1;
+  int8_t _sclk = -1, _mosi = -1, _miso = -1, _cs = -1, _busy = -1, _rst = -1, _pwrEn = -1, _sdCs = -1;
   uint16_t _panelW = 0, _panelH = 0;
   uint32_t _imgBufAddr = 0;
   uint16_t _rotation = 0;

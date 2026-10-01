@@ -152,6 +152,10 @@ struct Gray4PlaneTable {
 constexpr Gray4PlaneTable kGray4Planes;
 
 constexpr unsigned long READY_TIMEOUT_MS = 3000;
+// Hardware reset: RST low this long, then this long for the controller to boot
+// before the first HRDY poll (Waveshare's EPD_IT8951_Reset timings).
+constexpr unsigned long RESET_PULSE_MS = 10;
+constexpr unsigned long RESET_BOOT_MS = 200;
 
 // One pixel's 4bpp value from CrossPoint's anti-aliasing planes (base B/W + LSB +
 // MSB), matching the LilyGo ED047TC1 mapping: a set base bit is white; otherwise
@@ -266,6 +270,22 @@ uint16_t It8951Driver::readReg(uint16_t reg) {
 }
 
 void It8951Driver::systemRun() { writeCommand(CMD_SYS_RUN); }
+
+// A controller that powered up wedged holds HRDY low until its own reset: every
+// command then sits out READY_TIMEOUT_MS and begin() takes about a minute with the
+// last image frozen on the glass. The sleep path holds RST low through deep sleep
+// (PowerManager::powerDownRailsForSleep) and the hold survives the wake reset, so
+// release it before driving the pulse.
+void It8951Driver::resetController() {
+  if (_rst < 0) return;
+  const auto g = static_cast<gpio_num_t>(_rst);
+  gpio_hold_dis(g);
+  pinMode(_rst, OUTPUT);
+  digitalWrite(_rst, LOW);
+  delay(RESET_PULSE_MS);
+  digitalWrite(_rst, HIGH);
+  delay(RESET_BOOT_MS);
+}
 
 void It8951Driver::getDeviceInfo() {
   writeCommand(CMD_DEV_INFO);
@@ -895,6 +915,7 @@ void It8951Driver::begin(EpdBus& bus) {
   _mosi = d.mosi;
   _cs = d.cs;
   _busy = d.busy;
+  _rst = d.rst;
   _pwrEn = d.powerEnable;
   _miso = _cfg.miso;
   _sdCs = BoardConfig::ACTIVE.sd.cs;  // shared SPI bus: hold SD de-selected
@@ -918,6 +939,10 @@ void It8951Driver::begin(EpdBus& bus) {
     digitalWrite(_pwrEn, HIGH);  // enable the EPD power rail
     delay(100);
   }
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tBegin = millis();
+#endif
+  resetController();
 
   // Bring up the shared global SPI bus. SDCardManager::begin() may have already
   // begun this same object with the SD pins; that's fine *only* because a
@@ -954,9 +979,12 @@ void It8951Driver::begin(EpdBus& bus) {
   initDmaLoad();
 
   waitReady();
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tReady = millis();
+#endif
   // SYS_RUN before anything else. deepSleep() leaves the controller in CMD_SLEEP,
   // and on boards whose IT8951 rail is not switched and whose RST is unassigned
-  // (eMinimal bench: HAT 5V straight off the devkit) it stays there across the
+  // (M5Paper-style wiring with the rail left on) it stays there across the
   // host's deep-sleep wake and even an EN reset — GET_DEV_INFO then reads nothing
   // (the fallback geometry hides it), every wait returns instantly and the glass
   // never changes until a power cycle. Only SYS_RUN wakes it; on a running
@@ -979,6 +1007,9 @@ void It8951Driver::begin(EpdBus& bus) {
   // Clear to white with the INIT waveform (ignores buffer content).
   displayArea(0, 0, _panelW, _panelH, 0);
   waitDisplayReady();
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tInit = millis();
+#endif
   if (esp_reset_reason() == ESP_RST_DEEPSLEEP && _cfg.wakeScrub != It8951WakeScrub::None) {
     // Waking with the sleep cover on the glass: INIT alone leaves faint
     // residue of dark art (most visible in dithered fields, and confirmed on
@@ -1004,6 +1035,13 @@ void It8951Driver::begin(EpdBus& bus) {
   _memHasGray = false;
   _dirtyValid = false;
   buildGrayTable();
+#ifdef IT8951_TIMING_LOG
+  // "ready": RST pulse (if wired) to HRDY high, i.e. the controller's boot.
+  if (Serial)
+    Serial.printf("[it8951] begin: %s, ready %lu ms, INIT %lu ms, total %lu ms\n", _rst >= 0 ? "reset" : "no reset",
+                  (unsigned long)(tReady - tBegin), (unsigned long)(tInit - tReady),
+                  (unsigned long)(millis() - tBegin));
+#endif
 }
 
 // A refresh clears ghosting when it's a Full/Half (the consumer's stronger

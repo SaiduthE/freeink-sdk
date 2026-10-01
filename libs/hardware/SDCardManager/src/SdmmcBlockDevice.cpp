@@ -170,6 +170,15 @@ bool SdmmcBlockDevice::recover(const char* opName, const int err) {
   return ok;
 }
 
+// A recover() that failed leaves no card, and without this every later op would
+// fail until reboot. Retry the mount from the next op instead, under the same
+// rate limit. Sets recoveredThisOp when it had to, so the op recovers at most once.
+bool SdmmcBlockDevice::ensureCard(const char* opName, bool& recoveredThisOp) {
+  if (_card) return true;
+  recoveredThisOp = true;
+  return recover(opName, ESP_ERR_INVALID_STATE);
+}
+
 void SdmmcBlockDevice::end() {
   if (_card) {
     free(_card);
@@ -187,10 +196,11 @@ void SdmmcBlockDevice::end() {
 // (PSRAM / arbitrary alignment), which makes sdmmc_read/write_sectors fail. Bounce
 // through a DMA-capable buffer. (heap_caps_aligned_alloc via MALLOC_CAP_DMA.)
 bool SdmmcBlockDevice::readSectors(Sector_t sector, uint8_t* dst, size_t ns) {
-  if (!_card || !_dmaBuffer || !dst || ns == 0) return false;
+  if (!_dmaBuffer || !dst || ns == 0) return false;
   // At most one recover() per call, however many chunks the transfer takes —
   // see the recover() comment for the rationale.
   bool recoveredThisOp = false;
+  if (!ensureCard("read", recoveredThisOp)) return false;
   while (ns > 0) {
     const size_t count = ns > kMaxTransferSectors ? kMaxTransferSectors : ns;
     const size_t bytes = count * kSectorSize;
@@ -210,8 +220,9 @@ bool SdmmcBlockDevice::readSectors(Sector_t sector, uint8_t* dst, size_t ns) {
 }
 
 bool SdmmcBlockDevice::writeSectors(Sector_t sector, const uint8_t* src, size_t ns) {
-  if (!_card || !_dmaBuffer || !src || ns == 0) return false;
+  if (!_dmaBuffer || !src || ns == 0) return false;
   bool recoveredThisOp = false;
+  if (!ensureCard("write", recoveredThisOp)) return false;
   while (ns > 0) {
     const size_t count = ns > kMaxTransferSectors ? kMaxTransferSectors : ns;
     const size_t bytes = count * kSectorSize;
