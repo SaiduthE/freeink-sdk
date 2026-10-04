@@ -58,6 +58,13 @@ bool readReg16(uint8_t addr, uint8_t reg, uint16_t& out) {
   return true;
 }
 
+bool readReg16Be(uint8_t addr, uint8_t reg, uint16_t& out) {
+  uint16_t le = 0;
+  if (!readReg16(addr, reg, le)) return false;
+  out = static_cast<uint16_t>((le << 8) | (le >> 8));
+  return true;
+}
+
 bool readReg8(uint8_t addr, uint8_t reg, uint8_t& out) {
   if (addr == 0) return false;
   ensureWire();
@@ -205,9 +212,23 @@ bool cw2017EnsureProfile(const uint8_t addr) {
   return cw2017WaitUntilReady(addr);
 }
 
+// --- MAX17048 (Maxim ModelGauge) ---------------------------------------------
+// 16-bit big-endian registers. It estimates SoC from the cell voltage alone, so it
+// needs no profile upload and starts reporting within a second of power-up; its
+// first estimate settles over the next minutes of use.
+constexpr uint8_t MAX17048_REG_VCELL = 0x02;  // 78.125 uV/LSB
+constexpr uint8_t MAX17048_REG_SOC = 0x04;    // 1/256 % per LSB; can read a little over 100
+
 // SoC (0..100) from the active gauge, dispatched by type. false on I2C failure.
 bool readGaugeSoc(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.gaugeType == BoardConfig::GaugeType::Max17048) {
+    uint16_t raw = 0;
+    if (!readReg16Be(g.gaugeAddr, MAX17048_REG_SOC, raw)) return false;
+    const uint16_t soc = static_cast<uint16_t>((raw + 128) >> 8);
+    out = soc > 100 ? 100 : soc;
+    return true;
+  }
 #if FREEINK_DEVICE_WS397
   if (g.gaugeType == BoardConfig::GaugeType::Axp2101) {
     uint8_t soc = 0;
@@ -252,6 +273,12 @@ bool readGaugeSoc(uint16_t& out) {
 // Battery voltage (mV) from the active gauge, dispatched by type. false on failure.
 bool readGaugeMillivolts(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.gaugeType == BoardConfig::GaugeType::Max17048) {
+    uint16_t raw = 0;
+    if (!readReg16Be(g.gaugeAddr, MAX17048_REG_VCELL, raw)) return false;
+    out = static_cast<uint16_t>((static_cast<uint32_t>(raw) * 5 + 32) / 64);  // 78.125 uV = 5/64 mV
+    return true;
+  }
 #if FREEINK_DEVICE_WS397
   if (g.gaugeType == BoardConfig::GaugeType::Axp2101) return freeink::axp2101::batteryMillivolts(out);
 #endif
@@ -285,9 +312,10 @@ bool readGaugeCharging(bool& known) {
 #if FREEINK_DEVICE_WS397
   if (g.gaugeType == BoardConfig::GaugeType::Axp2101) return freeink::axp2101::isCharging(known);
 #endif
-  // CW2017 has no current register and the X4 Pro has no charger IC on this bus, so
-  // charging state is not observable from the gauge (the OEM infers it elsewhere).
-  if (g.gaugeType == BoardConfig::GaugeType::Cw2017) {
+  // CW2017 and MAX17048 have no current register, and neither board has a charger
+  // IC on this bus, so charging state is not observable from the gauge; callers
+  // fall back to the charger's STAT pin.
+  if (g.gaugeType == BoardConfig::GaugeType::Cw2017 || g.gaugeType == BoardConfig::GaugeType::Max17048) {
     known = false;
     return false;
   }
@@ -445,8 +473,9 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
     }
     // Charging: from a dedicated charger IC when present, else the gauge's own
     // Current() sign — so gauge-only boards (X3) report it too. A gauge that
-    // cannot observe charging at all (CW2017) leaves chargingKnown false; fall
-    // back to the charger's STAT pin when the board has one (X4 Pro GPIO21).
+    // cannot observe charging at all (CW2017, MAX17048) leaves chargingKnown
+    // false; fall back to the charger's STAT pin when the board has one (X4 Pro
+    // GPIO21, e-Minimal GPIO47).
     bool chargingKnown = false;
     bool charging = readGaugeCharging(chargingKnown);
     if (!chargingKnown && _chargeStatusPin >= 0) {
@@ -530,8 +559,8 @@ bool BatteryMonitor::isCharging() const {
   // Gauge boards: prefer a charger IC's status (BQ25896), else fall back to the
   // gauge's own Current() sign, so a board with a gauge but no charger IC (e.g.
   // X3) still reports charging. A gauge that cannot observe charging at all
-  // (CW2017) reports unknown — fall through to the STAT pin below (X4 Pro
-  // GPIO21). Failed reads report false.
+  // (CW2017, MAX17048) reports unknown — fall through to the STAT pin below
+  // (X4 Pro GPIO21, e-Minimal GPIO47). Failed reads report false.
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
     bool known = false;
     const bool charging = readGaugeCharging(known);

@@ -9,8 +9,9 @@
 //     a percentage; an optional charge-status pin (MCP73832 /STAT, active-LOW)
 //     drives isCharging().
 //   * I2C fuel gauge (FREEINK_BATTERY_I2C_GAUGE) — reads SoC/voltage/charge from a
-//     BQ27220 gauge (+ optional BQ25896 charger) over I2C; the ADC pin/divider are
-//     ignored. Used by X3 and LilyGo T5 S3. Config comes from
+//     BQ27220, CW2017, MAX17048 or AXP2101 (+ optional BQ25896 charger) over I2C;
+//     the ADC pin/divider are ignored. Used by every profile that sets
+//     batteryGauge.gaugeAddr. Config comes from
 //     BoardConfig::ACTIVE.batteryGauge, and gauge-vs-ADC is chosen at *runtime*
 //     (gaugeAddr != 0), so X3 (gauge) and X4 (ADC) work from one C3 binary.
 class BatteryMonitor {
