@@ -233,6 +233,9 @@ class PanelDriver {
   }
 
   // --- optional, controller-specific hooks (no-op by default) ---
+  // The next begin() leaves the glass as it is (no clearing pass): the host
+  // repaints over the retained frame with one clearing refresh.
+  virtual void setKeepGlassOnBegin(bool keep) { (void)keep; }
   virtual void requestResync(uint8_t settlePasses) { (void)settlePasses; }
   virtual void skipInitialResync() {}
   // Content-polarity hint: true while the facade is rendering inverted (dark

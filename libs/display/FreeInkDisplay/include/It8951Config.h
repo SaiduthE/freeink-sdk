@@ -62,7 +62,7 @@ struct It8951Config {
   uint16_t rotation;  // LD_IMG rotation 0/1/2/3 = 0/90/180/270°, or IT8951_ROTATE_AUTO
   uint16_t vcomMv;    // VCOM magnitude in mV (e.g. 2300 = -2.30 V); 0 = keep panel OTP
   uint8_t fullMode;   // clearing refresh (GC16 = 2). Used for Full/Half, wake from
-                      // standby, and the periodic ghost-clear below.
+                      // standby (unless parkWhenIdle), and the periodic ghost-clear.
   uint8_t fastMode;   // B/W page turns (DU = 1, 2-level differential).
   uint8_t grayMode;   // anti-aliased grayscale pages. DU4 is a 4-level DIRECT
                       // update: differential, so only changed pixels (the AA glyph
@@ -86,6 +86,12 @@ struct It8951Config {
                                 // Reads (device info, registers, HRDY-paced words)
                                 // are what fail first on long MISO runs, so a board
                                 // can push frames faster than it can talk.
+  bool parkWhenIdle;            // CMD_STANDBY after every refresh, SYS_RUN before the
+                                // next command. Standby keeps the frame memory, so the
+                                // next refresh stays differential. A running controller
+                                // idles at ~300 mW on the e-Minimal 7.8" HAT. false
+                                // (value-initialised) = standby only when the host
+                                // passes turnOff, and a GC16 clear on that wake.
 };
 
 }  // namespace freeink

@@ -271,6 +271,18 @@ uint16_t It8951Driver::readReg(uint16_t reg) {
 
 void It8951Driver::systemRun() { writeCommand(CMD_SYS_RUN); }
 
+void It8951Driver::wakeController() {
+  if (_running) return;
+  systemRun();
+  _running = true;
+}
+
+void It8951Driver::park() {
+  if (!_running) return;
+  writeCommand(CMD_STANDBY);
+  _running = false;
+}
+
 // A controller that powered up wedged holds HRDY low until its own reset: every
 // command then sits out READY_TIMEOUT_MS and begin() takes about a minute with the
 // last image frozen on the glass. The sleep path holds RST low through deep sleep
@@ -336,6 +348,7 @@ void It8951Driver::setBitmapMode(bool on, bool force) {
 }
 
 void It8951Driver::displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode) {
+  wakeController();  // some refreshes re-drive what the memory holds, with no load to wake it
   // The engine must read the memory the way the last load wrote it. INIT
   // (mode 0) ignores the memory, but keeping the bit honest costs nothing.
   setBitmapMode(_memBitmap);
@@ -582,10 +595,7 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
     loadImageBitmap(fb, y0, y1);
     return;
   }
-  if (!_running) {
-    systemRun();
-    _running = true;
-  }
+  wakeController();
 #ifdef IT8951_TIMING_LOG
   const uint32_t tLoad = micros();
 #endif
@@ -660,10 +670,7 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
 // extra rows carry the same content the memory already holds.
 void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) {
   if (!_rowBuf || !fb) return;
-  if (!_running) {
-    systemRun();
-    _running = true;
-  }
+  wakeController();
 #ifdef IT8951_TIMING_LOG
   const uint32_t tLoad = micros();
 #endif
@@ -761,10 +768,7 @@ void It8951Driver::buildGrayTable() {
 // 4-level gray reconstructed from the B/W base + the buffered LSB/MSB planes.
 void It8951Driver::loadImageGray(const uint8_t* base) {
   if (!_rowBuf) return;
-  if (!_running) {
-    systemRun();
-    _running = true;
-  }
+  wakeController();
 #ifdef IT8951_TIMING_LOG
   const uint32_t tLoad = micros();
 #endif
@@ -849,10 +853,7 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
 // 4bpp.
 bool It8951Driver::loadImageGray4(Gray4RowFill fill, void* ctx, uint8_t* baseOut) {
   if (!_rowBuf || !fill) return false;
-  if (!_running) {
-    systemRun();
-    _running = true;
-  }
+  wakeController();
 #ifdef IT8951_TIMING_LOG
   const uint32_t tLoad = micros();
 #endif
@@ -1004,13 +1005,19 @@ void It8951Driver::begin(EpdBus& bus) {
   _rotation = (_cfg.rotation == IT8951_ROTATE_AUTO) ? (_panelW < _panelH ? 1 : 0) : (_cfg.rotation & 0x03);
   _running = true;
 
-  // Clear to white with the INIT waveform (ignores buffer content).
-  displayArea(0, 0, _panelW, _panelH, 0);
-  waitDisplayReady();
+  // Clear to white with the INIT waveform (ignores buffer content), unless the
+  // host repaints over what the glass shows: then the first refresh, a GC16
+  // (_firstPaintPending), is the only one.
+  const bool keepGlass = _keepGlassOnBegin;
+  _keepGlassOnBegin = false;
+  if (!keepGlass) {
+    displayArea(0, 0, _panelW, _panelH, 0);
+    waitDisplayReady();
+  }
 #ifdef IT8951_TIMING_LOG
   const uint32_t tInit = millis();
 #endif
-  if (esp_reset_reason() == ESP_RST_DEEPSLEEP && _cfg.wakeScrub != It8951WakeScrub::None) {
+  if (!keepGlass && esp_reset_reason() == ESP_RST_DEEPSLEEP && _cfg.wakeScrub != It8951WakeScrub::None) {
     // Waking with the sleep cover on the glass: INIT alone leaves faint
     // residue of dark art (most visible in dithered fields, and confirmed on
     // eMinimal's glass too). Drive the pigment through a second pass: an
@@ -1038,14 +1045,15 @@ void It8951Driver::begin(EpdBus& bus) {
 #ifdef IT8951_TIMING_LOG
   // "ready": RST pulse (if wired) to HRDY high, i.e. the controller's boot.
   if (Serial)
-    Serial.printf("[it8951] begin: %s, ready %lu ms, INIT %lu ms, total %lu ms\n", _rst >= 0 ? "reset" : "no reset",
-                  (unsigned long)(tReady - tBegin), (unsigned long)(tInit - tReady),
+    Serial.printf("[it8951] begin: %s%s, ready %lu ms, INIT %lu ms, total %lu ms\n", _rst >= 0 ? "reset" : "no reset",
+                  keepGlass ? ", glass kept" : "", (unsigned long)(tReady - tBegin), (unsigned long)(tInit - tReady),
                   (unsigned long)(millis() - tBegin));
 #endif
 }
 
 // A refresh clears ghosting when it's a Full/Half (the consumer's stronger
-// refresh), a wake from standby (fresh image), or the periodic ghost-clear —
+// refresh), a wake from a host-requested standby (wakeOwesClear), or the
+// periodic ghost-clear —
 // otherwise it's the differential mode. DU/DU4 leave residue that accumulates
 // across menu and activity navigation; promoting to GC16 every
 // ghostClearInterval refreshes wipes it automatically, like the X3 driver, with
@@ -1053,7 +1061,7 @@ void It8951Driver::begin(EpdBus& bus) {
 // 1/256ths: a partial-area menu move counts its box, so a scroll does not flash
 // every eight presses the way eight page turns do.
 uint16_t It8951Driver::resolveMode(RefreshMode mode, uint16_t differential, uint16_t weight, bool force) {
-  const bool clear = force || (mode != RefreshMode::Fast) || !_running || _firstPaintPending ||
+  const bool clear = force || (mode != RefreshMode::Fast) || wakeOwesClear() || _firstPaintPending ||
                      (_cfg.ghostClearInterval != 0 &&
                       _partialsSinceClear >= static_cast<uint32_t>(_cfg.ghostClearInterval) * FRAME_WEIGHT);
   _firstPaintPending = false;
@@ -1167,7 +1175,7 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   }
   // A clear the host asked for, or that the driver owes (first paint, wake from
   // standby), resyncs everything. The others only need the box loaded.
-  const bool requestedClear = (mode != RefreshMode::Fast) || !_running || _firstPaintPending;
+  const bool requestedClear = (mode != RefreshMode::Fast) || wakeOwesClear() || _firstPaintPending;
   // A box-only GC16 leaves residue elsewhere, so it does not count as a clear
   // for the periodic cadence; it just takes the clearing waveform on its box.
   uint16_t dpyMode = resolveMode(mode, _cfg.fastMode, boxClear ? 0 : weight, forceClear && !boxClear);
@@ -1225,7 +1233,7 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
     _memHasGray = false;
     _dirtyValid = false;
   }
-  waitDisplayReady();
+  if (_running) waitDisplayReady();  // an unchanged frame on a parked controller drove nothing
   _memMirrorsBase = _base && fb;
 #ifdef IT8951_TIMING_LOG
   // "same frame": the diff found nothing to load; a refresh may still have run
@@ -1233,10 +1241,7 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   printTiming(unchanged ? "display (same frame)" : "display", tEntry, dpyMode);
 #endif
 
-  if (turnOff) {
-    writeCommand(CMD_STANDBY);  // park the controller; next load re-runs SYS_RUN
-    _running = false;
-  }
+  if (turnOff || _cfg.parkWhenIdle) park();
 }
 
 // Combined base: nothing goes to the panel here. Snapshot the B/W frame and the
@@ -1257,6 +1262,7 @@ void It8951Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshM
 
 void It8951Driver::deepSleep(EpdBus& bus) {
   (void)bus;
+  wakeController();  // LUTAFSR and SLEEP go to a running engine, not a parked one
   waitDisplayReady();
   writeCommand(CMD_SLEEP);
   _running = false;
@@ -1335,10 +1341,7 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   } else {
     dirtyUnion(0, static_cast<uint16_t>(_fbWb - 1), 0, static_cast<uint16_t>(_fbH - 1));
   }
-  if (turnOff) {
-    writeCommand(CMD_STANDBY);
-    _running = false;
-  }
+  if (turnOff || _cfg.parkWhenIdle) park();
 }
 
 // A host-rendered 16-level frame, a row at a time from `fill`: one load, one
@@ -1347,9 +1350,8 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
 //  - a base staged by displayGrayscaleBase() is superseded (this frame is the
 //    page); its refresh request and turnOff carry over, the stronger mode wins;
 //  - the waveform is resolveMode(mode, grayMode): GC16 for Full/Half, the
-//    first paint, a wake from standby or the periodic clear, else DU4 --
-//    resolved before the load, so a wake from standby (!_running) clears, as
-//    display() does;
+//    first paint, a wake that owes a clear or the periodic clear, else DU4 --
+//    resolved before the load wakes the controller, as display() does;
 //  - _base/_gLsb/_gMsb are re-derived from the rows, so _memMirrorsBase and
 //    _memHasGray hold and display()'s diff box, grayWithin() promotion and
 //    largeBox logic apply unchanged. Without those buffers, _memMirrorsBase is
@@ -1384,10 +1386,7 @@ bool It8951Driver::displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, R
   } else {
     dirtyUnion(0, static_cast<uint16_t>(_fbWb - 1), 0, static_cast<uint16_t>(_fbH - 1));
   }
-  if (turnOff) {
-    writeCommand(CMD_STANDBY);
-    _running = false;
-  }
+  if (turnOff || _cfg.parkWhenIdle) park();
   return true;
 }
 
@@ -1439,10 +1438,20 @@ static const It8951Config& it8951ActiveConfig() { return it8951DefaultConfig(); 
 // page, from what the frame memory already holds -- no reload (~0.55 s).
 void It8951Driver::repeatLastRefresh(EpdBus& bus) {
   (void)bus;
-  if (!_running) return;
+  if (wakeOwesClear()) return;  // after a host-requested standby the next page clears anyway
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tEntry = micros();
+  _loadUs = 0;
+  _loadBytes = 0;
+#endif
+  wakeController();
   waitDisplayReady();
   displayArea(0, 0, _panelW, _panelH, _cfg.fullMode);
   waitDisplayReady();
+#ifdef IT8951_TIMING_LOG
+  printTiming("repeat (dark page)", tEntry, _cfg.fullMode);
+#endif
+  if (_cfg.parkWhenIdle) park();
 }
 
 PanelDriver& it8951Driver() {

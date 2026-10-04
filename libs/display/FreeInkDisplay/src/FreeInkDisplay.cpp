@@ -241,6 +241,8 @@ void FreeInkDisplay::begin() {
   if (frameBuffer1) memset(frameBuffer1, 0xFF, bufferSize);
 #endif
 
+  _driver->setKeepGlassOnBegin(_keepGlassOnBegin);
+  _keepGlassOnBegin = false;
   _driver->begin(_bus);
 }
 

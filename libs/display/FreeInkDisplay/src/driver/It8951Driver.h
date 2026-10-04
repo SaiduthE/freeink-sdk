@@ -61,6 +61,7 @@ class It8951Driver : public PanelDriver {
   }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
   void repeatLastRefresh(EpdBus& bus) override;
+  void setKeepGlassOnBegin(bool keep) override { _keepGlassOnBegin = keep; }
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
   void writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const uint8_t* rows, uint16_t yStart,
@@ -94,6 +95,11 @@ class It8951Driver : public PanelDriver {
   // --- IT8951 operations ---
   uint32_t loadClockHz() const { return _cfg.loadSpiHz ? _cfg.loadSpiHz : _cfg.spiHz; }
   void systemRun();
+  void wakeController();  // SYS_RUN if parked; every command that drives the engine goes through it
+  void park();            // CMD_STANDBY; call only with no refresh in flight
+  // A wake from a host-requested standby clears the glass; with parkWhenIdle the
+  // controller parks after every refresh and the memory it kept is trusted.
+  bool wakeOwesClear() const { return !_running && !_cfg.parkWhenIdle; }
   void getDeviceInfo();
   void setTargetMemoryAddr(uint32_t addr);
   void setVcom(uint16_t mv);
@@ -187,6 +193,7 @@ class It8951Driver : public PanelDriver {
   uint32_t _imgBufAddr = 0;
   uint16_t _rotation = 0;
   bool _running = false;
+  bool _keepGlassOnBegin = false;  // the next begin() skips INIT and the wake scrub
 
   // Automatic ghost-clear: count differential (DU/DU4) refreshes and promote to a
   // GC16 clear every ghostClearInterval. _lastClear lets the gray pass match the
