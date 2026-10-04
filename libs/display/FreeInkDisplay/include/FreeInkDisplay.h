@@ -297,6 +297,11 @@ class FreeInkDisplay {
 
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
 
+  // The next begin() keeps what the glass shows instead of clearing it (on
+  // drivers that clear at begin, the IT8951): for a wake that repaints the same
+  // screen, so the first refresh is the only one. One-shot.
+  void keepGlassOnNextBegin() { _keepGlassOnBegin = true; }
+
   // Hint the X3 policy to run a one-shot full resync on next update.
   void requestResync(uint8_t settlePasses = 0);
   void skipInitialResync();
@@ -499,6 +504,7 @@ class FreeInkDisplay {
   bool _singleBufferFastDiff = false;
   bool _fastGrayscaleLut = false;
   bool _inverted = false;
+  bool _keepGlassOnBegin = false;
   bool _inversionDirty = false;
 
   // Runtime display geometry (seeded from the driver at begin()).

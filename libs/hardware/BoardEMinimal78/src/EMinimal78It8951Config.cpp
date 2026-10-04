@@ -62,7 +62,8 @@ const It8951Config& eminimal78It8951Config() {
       13333333,  // loadSpiHz: 13.3 MHz while the HAT runs on jumper wires. On the
                  // 2026-10-02 bench (breadboard + Dupont jumpers) 26.67 MHz split and
                  // shifted the image while the framebuffer was clean; 13.3 cured it.
-                 // Retry 26666667 once the HAT wiring is soldered short. History: bulk write at 26.67 MHz (80/3). G2 measured
+                 // Retry 26666667 once the HAT wiring is soldered short. History:
+                 // bulk write at 26.67 MHz (80/3). G2 measured
                  // the 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
                  // read failed there -- reads run out first on jumpers -- so only
                  // the write-only burst takes the fast clock; commands, reads and
@@ -73,6 +74,11 @@ const It8951Config& eminimal78It8951Config() {
                  // multi-second freeze (HRDY stall), would mean back to 20000000.
                  // The S3 rounds a request DOWN to 80/N, so 80/3 must be asked for
                  // as 26666667 -- 26666666 lands on 20 MHz. 40 MHz: try on a PCB.
+      true,      // parkWhenIdle: CMD_STANDBY after every refresh. Measured 2026-10-03 at
+                 // the INA260 (SYS, Home idle): 636 mW with the controller running,
+                 // 333 mW parked. Page turns stay DU4: the frame memory survives
+                 // standby. Also what Waveshare's "never leave the panel powered and
+                 // idle" asks for, without cutting the rail (vault 05 #5).
   };
   return cfg;
 }
