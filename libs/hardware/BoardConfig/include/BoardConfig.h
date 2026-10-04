@@ -276,14 +276,14 @@
 #endif
 
 // I2C fuel-gauge battery backend. Compiled in when a build contains a gauge
-// device (X3's BQ27220, or LilyGo's BQ27220+BQ25896). Selection is then *runtime*
-// per active profile (BatteryMonitor uses the gauge only when
+// device (X3's BQ27220, LilyGo's BQ27220+BQ25896, e-Minimal's MAX17048). Selection
+// is then *runtime* per active profile (BatteryMonitor uses the gauge only when
 // ACTIVE.batteryGauge.gaugeAddr != 0) — required because X3 (gauge) and X4 (ADC)
 // share one C3 binary.
 #ifndef FREEINK_BATTERY_I2C_GAUGE
 #define FREEINK_BATTERY_I2C_GAUGE                                                            \
   (FREEINK_DEVICE_X3 || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4PRO || \
-   FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_WS397)
+   FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_EMINIMAL)
 #endif
 #ifndef FREEINK_CAP_COLOR
 #define FREEINK_CAP_COLOR (FREEINK_DEVICE_M5)
@@ -505,7 +505,10 @@ struct SdmmcPins {
 // profile loaded before it reports a valid SoC (Xteink X4 Pro).
 // Axp2101: not a gauge chip but a PMIC whose fuel-gauge block reports SoC directly
 // (Waveshare ESP32-S3-ePaper-3.97). Its registers live in Axp2101.h.
-enum class GaugeType : uint8_t { Bq27220, Cw2017, Axp2101 };
+// Max17048: Maxim ModelGauge, big-endian registers, no profile upload and no
+// current register, so charge status comes from the board's charger STAT pin
+// (e-Minimal).
+enum class GaugeType : uint8_t { Bq27220, Cw2017, Axp2101, Max17048 };
 
 // I2C fuel-gauge / charger wiring (e.g. BQ27220 + BQ25896 on LilyGo T5 S3). When
 // gaugeAddr != 0 (and FREEINK_BATTERY_I2C_GAUGE is set), BatteryMonitor reads the
@@ -515,7 +518,7 @@ struct BatteryGaugeConfig {
   int8_t i2cSda;
   int8_t i2cScl;
   uint32_t i2cHz;
-  uint8_t gaugeAddr;    // BQ27220 = 0x55; CW2017 = 0x63; 0 = no I2C gauge (use ADC)
+  uint8_t gaugeAddr;    // BQ27220 = 0x55; CW2017 = 0x63; MAX17048 = 0x36; 0 = no I2C gauge (use ADC)
   uint8_t chargerAddr;  // BQ25896 = 0x6B; 0 = none
   // Arduino I2C controller index: 0 = Wire, 1 = Wire1. Default 0. Set to 1 on
   // boards where the gauge sits on a different physical bus than another I2C
@@ -1394,14 +1397,15 @@ constexpr BoardProfile EMINIMAL_78 = {
     // batteryAdc: GPIO 8 = ADC1_CH7 (ADC2 is arbitrated with WiFi and fails
     // during hotspot/join). 2 x 470k divider from the cell with 100 nF across
     // the lower leg — the S3's sample-and-hold starves on a 470k source without
-    // it. Bench: a 10k pot across 3V3 stands in for the cell until one exists.
+    // it. BatteryMonitor reads the gauge below instead; the divider stays as a
+    // bench cross-check (CMD:BATTERY) until it comes off and frees GPIO 8.
     8,
-    PIN_UNASSIGNED,  // batteryChargeStatus
-    2.0f,            // batteryDividerMultiplier: equal legs, so cell = 2 x ADC
-    PIN_UNASSIGNED,  // usbDetect — reserved GPIO 9 from the charger's 5 V input via
-                     // 100k/100k; when it is wired, exempt EMINIMAL from the
-                     // AfterUSBPower re-sleep in main.cpp first
-    NO_TOUCH,        // four buttons by design: touch on e-ink fights the refresh cycle
+    47,    // batteryChargeStatus: bq24074 CHG, open-drain, LOW = charging
+    2.0f,  // batteryDividerMultiplier: equal legs, so cell = 2 x ADC
+    9,     // usbDetect: the charger's VBUS through 56k/100k, HIGH = cable in.
+           // main.cpp exempts EMINIMAL from the AfterUSBPower re-sleep: the
+           // Switch cuts the ESP, so a cold boot here is always a switch-on.
+    NO_TOUCH,  // four buttons by design: touch on e-ink fights the refresh cycle
     NO_FRONTLIGHT,
     NO_AUDIO,
     NO_LEDS,
@@ -1409,7 +1413,9 @@ constexpr BoardProfile EMINIMAL_78 = {
     // clk, cmd, d0, d1, d2, d3, busWidth. 1-bit measured at 1.94 MB/s (323 ms per
     // 2bpp page) on the bench; 4-bit is untested and would need D1-D3 broken out.
     {12, 11, 13, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1},
-    NO_GAUGE,
+    // MAX17048 gauge in the cell lead, on GPIO 41/42 with the bench INA260 (0x40).
+    // 100 kHz: jumper wiring and two boards' 10k pull-ups in parallel.
+    {41, 42, 100000, 0x36, 0, 0, GaugeType::Max17048},
     NO_MIC,
     NO_SENSORS,
     // uiScale: ~300 PPI, far denser than the ~220-235 PPI boards above, so chrome
