@@ -1409,7 +1409,10 @@ constexpr BoardProfile EMINIMAL_78 = {
     NO_FRONTLIGHT,
     NO_AUDIO,
     NO_LEDS,
-    NO_FLIP,
+    // The case holds the panel upside down. It8951Driver does not apply this (LD_IMG
+    // rotation 2 would cost the 1bpp bitmap and differential loads, both rotation 0
+    // only); the host renderer draws the frame turned 180 degrees instead.
+    ROTATE_180,
     // clk, cmd, d0, d1, d2, d3, busWidth. 1-bit measured at 1.94 MB/s (323 ms per
     // 2bpp page) on the bench; 4-bit is untested and would need D1-D3 broken out.
     {12, 11, 13, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1},

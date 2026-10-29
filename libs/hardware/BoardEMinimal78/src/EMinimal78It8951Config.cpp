@@ -59,12 +59,11 @@ const It8951Config& eminimal78It8951Config() {
                  // 2bpp was tried 2026-09-18: the controller expands a 2-bit v to
                  // v<<2, not v*5 (datasheet fig. 7-16 -- the chip, not the firmware):
                  // white landed at 0xC, every page came up grey. Not an option.
-      13333333,  // loadSpiHz: 13.3 MHz while the HAT runs on jumper wires. On the
-                 // 2026-10-02 bench (breadboard + Dupont jumpers) 26.67 MHz split and
-                 // shifted the image while the framebuffer was clean; 13.3 cured it.
-                 // Retry 26666667 once the HAT wiring is soldered short. History:
-                 // bulk write at 26.67 MHz (80/3). G2 measured
-                 // the 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
+      26666667,  // loadSpiHz: the bulk image write at 26.67 MHz (80/3). On jumper
+                 // wires (2026-10-02 bench) it split and shifted the image and only
+                 // 13.3 MHz ran clean; back at 26.67 for the built case's short
+                 // leads (2026-10-28), 13333333 if that bench symptom returns.
+                 // G2 measured the 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
                  // read failed there -- reads run out first on jumpers -- so only
                  // the write-only burst takes the fast clock; commands, reads and
                  // HRDY-paced words stay on spiHz. 26.67 MHz is the standard for
