@@ -62,6 +62,11 @@ class It8951Driver : public PanelDriver {
   }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
   void repeatLastRefresh(EpdBus& bus) override;
+  // GC16 on the box alone, trusting nothing about the frame memory: draws over
+  // a glass kept through deep sleep (setKeepGlassOnBegin), whose old image
+  // stays outside the box. Box in framebuffer pixels.
+  void displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y, uint16_t w,
+                     uint16_t h, bool turnOff) override;
   void setKeepGlassOnBegin(bool keep) override { _keepGlassOnBegin = keep; }
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
