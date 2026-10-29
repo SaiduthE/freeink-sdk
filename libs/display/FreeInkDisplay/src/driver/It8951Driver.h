@@ -99,7 +99,7 @@ class It8951Driver : public PanelDriver {
   uint16_t readReg(uint16_t reg);
 
   // --- IT8951 operations ---
-  uint32_t loadClockHz() const { return _cfg.loadSpiHz ? _cfg.loadSpiHz : _cfg.spiHz; }
+  uint32_t loadClockHz() const { return _cfg.loadSpiHz && !_safeLoad ? _cfg.loadSpiHz : _cfg.spiHz; }
   void systemRun();
   void wakeController();  // SYS_RUN if parked; every command that drives the engine goes through it
   void park();            // CMD_STANDBY; call only with no refresh in flight
@@ -129,6 +129,11 @@ class It8951Driver : public PanelDriver {
   // is tracked in _memBitmap; a load in the other format widens itself to the
   // whole frame so the memory is never mixed.
   void loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1);
+  void sendBitmapRows(const uint8_t* fb, uint16_t y0, uint16_t y1);  // one bitmap burst, rows as given
+  // Rows y0..y1 of a bitmap load read back from the frame memory (every
+  // verifyLoadRows-th, and the last) and compared with fb as sent. Logs and
+  // returns false at the first row that differs.
+  bool bitmapRowsMatch(const uint8_t* fb, uint16_t y0, uint16_t y1);
   bool bitmapLoads() const { return _cfg.loadDepth == It8951LoadDepth::Bpp1 && _rotation == 0; }
   // Flip the display engine between reading the frame memory as 8-bit levels
   // and as a 1bpp bitmap painted with the BGVR colour table. `force` writes
@@ -217,12 +222,20 @@ class It8951Driver : public PanelDriver {
   // other format goes whole-frame, and displayArea() sets the engine to match.
   bool _memBitmap = false;
   bool _bitmapModeOn = false;  // what the UP1SR bitmap bit was last set to
+  // Load read-back (It8951Config::verifyLoadRows). _readsOk: GET_DEV_INFO read
+  // back plausibly, so MISO works. _safeLoad: the resend after a mismatch goes
+  // polled at spiHz. _verifyOff: a resend at spiHz still read back wrong, so the
+  // read-back itself is not trusted for the rest of the run.
+  bool _readsOk = false;
+  bool _safeLoad = false;
+  bool _verifyOff = false;
 #ifdef IT8951_TIMING_LOG
   // Bench instrument (-DIT8951_TIMING_LOG): one serial line per display() /
   // displayGray() with what the push and the refresh cost. The load functions
   // add their bytes and microseconds here; display() zeroes them on entry.
   uint32_t _loadUs = 0;
   uint32_t _loadBytes = 0;
+  uint32_t _verifyUs = 0;
   void printTiming(const char* what, uint32_t t0Us, uint16_t dpyMode);
 #endif
   // Combine table for loadImageGray(): index (base nibble << 8 | lsb nibble << 4

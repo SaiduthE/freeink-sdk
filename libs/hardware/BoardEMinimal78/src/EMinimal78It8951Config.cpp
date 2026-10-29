@@ -59,28 +59,35 @@ const It8951Config& eminimal78It8951Config() {
                  // 2bpp was tried 2026-09-18: the controller expands a 2-bit v to
                  // v<<2, not v*5 (datasheet fig. 7-16 -- the chip, not the firmware):
                  // white landed at 0xC, every page came up grey. Not an option.
-      26666667,  // loadSpiHz: the bulk image write at 26.67 MHz (80/3), clean in the
-                 // built case (2026-10-28). 40 MHz (80/2) cut a grey load from ~410 to
-                 // ~318 ms there but now and then lost a write: a region of the glass
-                 // kept a stale selection highlight while the frame buffer was right
-                 // (2026-10-29). On jumper wires (2026-10-02 bench) 26.67 split and
-                 // shifted the image and only 13.3 MHz ran clean.
+      40000000,  // loadSpiHz: the bulk image write at 40 MHz (80/2), in the built case.
+                 // Cuts a grey load from ~410 ms (26.67) to ~318. Its one failure
+                 // (2026-10-29): now and then a Home highlight move's band did not
+                 // land, and the old highlight stayed on the glass -- seen at 26.67
+                 // too, more rarely. verifyLoadRows below catches and resends that.
+                 // On jumper wires (2026-10-02 bench) 26.67 split and shifted the
+                 // image and only 13.3 MHz ran clean.
                  // G2 measured the 4bpp push clean at 20 (580 ms) while the 20-word GET_DEV_INFO
                  // read failed there -- reads run out first on jumpers -- so only
                  // the write-only burst takes the fast clock; commands, reads and
-                 // HRDY-paced words stay on spiHz. 26.67 MHz is the standard for
-                 // this board (decided 2026-09-24): a 1283 KB grey frame in
-                 // 409-414 ms (was 541-547 at 20), no DMA errors, no stalls, judged
-                 // clean on the glass. Speckle or shifted rows on a grey page, or a
-                 // multi-second freeze (HRDY stall), would mean back to 20000000.
+                 // HRDY-paced words stay on spiHz. 26.67 MHz (the standard from
+                 // 2026-09-24): a 1283 KB grey frame in 409-414 ms (541-547 at 20),
+                 // no DMA errors, no stalls. Speckle or shifted rows on a grey page,
+                 // or a multi-second freeze (HRDY stall), would mean back to 26666667.
                  // The S3 rounds a request DOWN to 80/N, so 80/3 must be asked for
-                 // as 26666667 -- 26666666 lands on 20 MHz. 40 MHz: try on a PCB.
+                 // as 26666667 -- 26666666 lands on 20 MHz.
       true,      // parkWhenIdle: CMD_STANDBY after every refresh. Measured 2026-10-03 at
                  // the INA260 (SYS, Home idle): 636 mW with the controller running,
                  // 333 mW parked. Page turns stay DU4: the frame memory survives
                  // standby. Also what Waveshare's "never leave the panel powered and
                  // idle" asks for, without cutting the rail (vault 05 #5).
       true,      // combinedGray: base and AA planes in one load and one DU4 refresh.
+      8,         // verifyLoadRows: read every 8th row of a B/W load back (and the
+                 // last) and resend at spiHz on a mismatch. Grey 4bpp loads are
+                 // not checked; they ran clean at 40 MHz.
+      6,         // menuMode = A2 for highlight moves (bench: 192 ms vs DU's 299;
+                 // DU ran ~500 ms on Home in the case). Judged 2026-10-29: moves
+                 // feel quicker, a faint shadow of the old highlight stays until
+                 // the next screen change -- accepted. 0 puts menus back on DU.
   };
   return cfg;
 }

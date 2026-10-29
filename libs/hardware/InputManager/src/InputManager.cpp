@@ -543,6 +543,19 @@ void InputManager::update() {
 
   const uint8_t state = getState();
 
+  // Plain GPIO keys: commit a change on the first poll that sees it, then hold
+  // it for EDGE_LOCKOUT_MS while the contacts settle. Waiting for two agreeing
+  // polls instead lost any tap shorter than two loop passes (~10-20 ms). ADC
+  // ladders pass through other keys' bands on the way to a reading, so they
+  // keep waiting for a stable one.
+  if (BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::DigitalButtons) {
+    if (state != currentState && currentTime - lastDebounceTime > EDGE_LOCKOUT_MS) {
+      applyStateChange(state, currentTime);
+      lastDebounceTime = currentTime;
+    }
+    return;
+  }
+
   // Debounce
   if (state != lastState) {
     lastDebounceTime = currentTime;
