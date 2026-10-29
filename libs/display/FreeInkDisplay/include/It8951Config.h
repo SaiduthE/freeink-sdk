@@ -92,6 +92,16 @@ struct It8951Config {
                                 // idles at ~300 mW on the e-Minimal 7.8" HAT. false
                                 // (value-initialised) = standby only when the host
                                 // passes turnOff, and a GC16 clear on that wake.
+  bool combinedGray;            // anti-aliased pages as one load and one refresh.
+                                // false (value-initialised; M5Paper): the host
+                                // displays the B/W page, then the gray pass loads
+                                // base + planes again and refines the edges with
+                                // grayMode. true: advertise GrayscaleBase::Combined,
+                                // so the base is only staged and the gray pass is
+                                // the page's single refresh -- and because that
+                                // grayMode page is then the only drive the glass
+                                // got, the next B/W screen change is a clear
+                                // (fullMode) instead of fastMode.
 };
 
 }  // namespace freeink

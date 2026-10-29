@@ -57,7 +57,8 @@ class It8951Driver : public PanelDriver {
   // displayGray() commits it.
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const override {
     if (mode != GrayscaleMode::Overlay) return {};
-    return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Combined, true, false, false};
+    return {GrayscaleEncoding::OverlayMasks, _cfg.combinedGray ? GrayscaleBase::Combined : GrayscaleBase::Separate,
+            true, false, false};
   }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
   void repeatLastRefresh(EpdBus& bus) override;
