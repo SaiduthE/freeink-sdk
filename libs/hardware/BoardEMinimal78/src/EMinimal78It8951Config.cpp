@@ -80,6 +80,7 @@ const It8951Config& eminimal78It8951Config() {
                  // 333 mW parked. Page turns stay DU4: the frame memory survives
                  // standby. Also what Waveshare's "never leave the panel powered and
                  // idle" asks for, without cutting the rail (vault 05 #5).
+      true,      // combinedGray: base and AA planes in one load and one DU4 refresh.
   };
   return cfg;
 }
