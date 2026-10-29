@@ -439,6 +439,7 @@ class InputManager {
 
   static constexpr int ADC_NO_BUTTON = 3900;
   static constexpr unsigned long DEBOUNCE_DELAY = 5;
+  static constexpr unsigned long EDGE_LOCKOUT_MS = 20;  // DigitalButtons: hold after a committed change
   static constexpr unsigned long CONFIRM_BACK_HOLD_MS = 650;
   static constexpr unsigned long CONFIRM_POWER_HOLD_MS = 400;
   static constexpr unsigned long TWO_BUTTON_HOLD_MS = 650;

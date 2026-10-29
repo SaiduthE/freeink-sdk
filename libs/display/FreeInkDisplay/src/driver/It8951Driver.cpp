@@ -74,6 +74,9 @@ constexpr uint16_t CMD_STANDBY = 0x0002;
 constexpr uint16_t CMD_SLEEP = 0x0003;
 constexpr uint16_t CMD_REG_RD = 0x0010;
 constexpr uint16_t CMD_REG_WR = 0x0011;
+constexpr uint16_t CMD_MEM_BST_RD_T = 0x0012;  // frame-memory read: address, word count
+constexpr uint16_t CMD_MEM_BST_RD_S = 0x0013;  // start it; the words follow as a data read
+constexpr uint16_t CMD_MEM_BST_END = 0x0015;
 constexpr uint16_t CMD_LD_IMG_AREA = 0x0021;
 constexpr uint16_t CMD_LD_IMG_END = 0x0022;
 constexpr uint16_t CMD_DEV_INFO = 0x0302;
@@ -308,7 +311,8 @@ void It8951Driver::getDeviceInfo() {
   _imgBufAddr = (static_cast<uint32_t>(info[3]) << 16) | info[2];
   // Reject an implausible read (no MISO / cold controller) and fall back so the
   // load path still targets a valid buffer.
-  if (_panelW == 0 || _panelW > 2048 || _panelH == 0 || _panelH > 2048) {
+  _readsOk = _panelW != 0 && _panelW <= 2048 && _panelH != 0 && _panelH <= 2048;
+  if (!_readsOk) {
     _panelW = _fbW;
     _panelH = _fbH;
   }
@@ -397,7 +401,7 @@ void It8951Driver::streamImageRows(uint16_t numRows, uint16_t rowBytes, Fill&& f
   _spi.transfer16(PRE_WR);  // blocking: done on the wire before the pads move
   uint16_t row = 0;         // first row not yet handed to the wire
 #if IT8951_DMA_ENABLED
-  if (_dmaDev && !_dmaFailed && rowBytes != 0 && rowBytes <= _dmaChunkBytes) {
+  if (_dmaDev && !_dmaFailed && !_safeLoad && rowBytes != 0 && rowBytes <= _dmaChunkBytes) {
     const uint16_t perChunk = static_cast<uint16_t>(_dmaChunkBytes / rowBytes);
     routeLoadPinsToDma(true);
     uint8_t inFlight = 0;
@@ -670,12 +674,6 @@ void It8951Driver::loadImageArea(const uint8_t* fb, uint16_t xb0, uint16_t xb1, 
 // extra rows carry the same content the memory already holds.
 void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) {
   if (!_rowBuf || !fb) return;
-  wakeController();
-#ifdef IT8951_TIMING_LOG
-  const uint32_t tLoad = micros();
-#endif
-  setTargetMemoryAddr(_imgBufAddr);
-
   if (!_memBitmap) {
     // A bitmap over levels: replace the whole frame (see loadImageArea).
     y0 = 0;
@@ -686,6 +684,38 @@ void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) 
     const uint32_t end = (static_cast<uint32_t>(y1) + BITMAP_ROW_ALIGN) & ~static_cast<uint32_t>(BITMAP_ROW_ALIGN - 1);
     y1 = static_cast<uint16_t>((end > _fbH ? _fbH : end) - 1);
   }
+  sendBitmapRows(fb, y0, y1);
+  if (_cfg.verifyLoadRows == 0 || !_readsOk || _verifyOff) return;
+
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tVerify = micros();
+  const uint32_t loadUsBefore = _loadUs;  // a resend counts as load, not verify
+#endif
+  if (!bitmapRowsMatch(fb, y0, y1)) {
+    // The fast burst lost data: the glass would keep the old content there
+    // while _base says it is current, so no later diff would ever reload it.
+    _safeLoad = true;
+    sendBitmapRows(fb, y0, y1);
+    _safeLoad = false;
+    if (bitmapRowsMatch(fb, y0, y1)) {
+      if (Serial) Serial.printf("[it8951] resent rows %u..%u at %lu Hz: ok\n", y0, y1, (unsigned long)_cfg.spiHz);
+    } else {
+      _verifyOff = true;
+      if (Serial) Serial.printf("[it8951] rows %u..%u still read back wrong at %lu Hz; read-back off\n", y0, y1,
+                                (unsigned long)_cfg.spiHz);
+    }
+  }
+#ifdef IT8951_TIMING_LOG
+  _verifyUs += micros() - tVerify - (_loadUs - loadUsBefore);
+#endif
+}
+
+void It8951Driver::sendBitmapRows(const uint8_t* fb, uint16_t y0, uint16_t y1) {
+  wakeController();
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tLoad = micros();
+#endif
+  setTargetMemoryAddr(_imgBufAddr);
 
   const uint16_t arg = static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_8 << 4) | 0);
   writeCommand(CMD_LD_IMG_AREA);
@@ -716,6 +746,46 @@ void It8951Driver::loadImageBitmap(const uint8_t* fb, uint16_t y0, uint16_t y1) 
   _loadUs += micros() - tLoad;
   _loadBytes += static_cast<uint32_t>(_fbWb) * (y1 - y0 + 1);
 #endif
+}
+
+// The load declared 8bpp, so bitmap row y byte k sits at imgBuf + y * panelW + k.
+// A read word carries the lower address in its low byte (bench, 2026-09-18), so
+// each pair arrives high byte first. Reads run at spiHz, in _rowBuf.
+bool It8951Driver::bitmapRowsMatch(const uint8_t* fb, uint16_t y0, uint16_t y1) {
+  const uint16_t words = static_cast<uint16_t>((_fbWb + 1) / 2);
+  for (uint32_t y = y0;; y += _cfg.verifyLoadRows) {
+    if (y > y1) y = y1;
+    const uint32_t addr = _imgBufAddr + y * static_cast<uint32_t>(_panelW);
+    writeCommand(CMD_MEM_BST_RD_T);
+    writeData(static_cast<uint16_t>(addr & 0xFFFF));
+    writeData(static_cast<uint16_t>(addr >> 16));
+    writeData(words);
+    writeData(0);
+    writeCommand(CMD_MEM_BST_RD_S);
+    waitReady();
+    _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
+    digitalWrite(_cs, LOW);
+    _spi.transfer16(PRE_RD);
+    _spi.transfer16(0x0000);  // dummy word the controller requires before valid data
+    memset(_rowBuf, 0, static_cast<size_t>(words) * 2);
+    _spi.transfer(_rowBuf, static_cast<uint32_t>(words) * 2);
+    digitalWrite(_cs, HIGH);
+    _spi.endTransaction();
+    writeCommand(CMD_MEM_BST_END);
+
+    const uint8_t* src = fb + y * _fbWb;
+    for (uint16_t k = 0; k < _fbWb; k++) {
+      const uint8_t sent = BITMAP_LSB_FIRST ? kBitRev.v[src[k]] : src[k];
+      const uint8_t got = _rowBuf[k ^ 1];
+      if (got != sent) {
+        if (Serial)
+          Serial.printf("[it8951] load rows %u..%u: row %lu byte %u read back %02X, sent %02X\n", y0, y1,
+                        (unsigned long)y, k, got, sent);
+        return false;
+      }
+    }
+    if (y == y1) return true;
+  }
 }
 
 // Row-by-row memcmp against the snapshot, then the first and last differing byte
@@ -1122,6 +1192,7 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   const uint32_t tEntry = micros();
   _loadUs = 0;
   _loadBytes = 0;
+  _verifyUs = 0;
 #endif
 
   _baseStaged = false;  // a plain B/W display supersedes any base waiting for gray planes
@@ -1160,7 +1231,7 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
 
   // What this refresh is, and what it counts toward the periodic ghost-clear:
   //  - unchanged: nothing driven, counts nothing;
-  //  - a partial box over B/W (a menu highlight move): DU on the box, counts
+  //  - a partial box over B/W (a menu highlight move): menuMode (else DU) on the box, counts
   //    nothing (residue there is mild and the next screen change clears it);
   //  - gray under the box: GC16 on the box, unless a clear is requested anyway;
   //    a whole-frame one is a full clear;
@@ -1185,7 +1256,8 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
     dpyMode = _cfg.fullMode;
     _lastClear = false;
   } else {
-    dpyMode = resolveMode(mode, _cfg.fastMode, weight, forceClear);
+    const bool menuMove = haveBox && !largeBox && !grayInBox && _cfg.menuMode != 0;
+    dpyMode = resolveMode(mode, menuMove ? _cfg.menuMode : _cfg.fastMode, weight, forceClear);
   }
 
 #ifdef IT8951_PROBE_DEBUG
@@ -1264,6 +1336,7 @@ void It8951Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* 
   const uint32_t tEntry = micros();
   _loadUs = 0;
   _loadBytes = 0;
+  _verifyUs = 0;
 #endif
   _baseStaged = false;
   const uint16_t xEnd = static_cast<uint16_t>(x + w > _fbW ? _fbW : x + w);
@@ -1348,6 +1421,7 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   const uint32_t tEntry = micros();
   _loadUs = 0;
   _loadBytes = 0;
+  _verifyUs = 0;
 #endif
 #ifdef IT8951_PROBE_DEBUG
   if (Serial && base) {
@@ -1410,6 +1484,7 @@ bool It8951Driver::displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, R
   const uint32_t tEntry = micros();
   _loadUs = 0;
   _loadBytes = 0;
+  _verifyUs = 0;
 #endif
   if (_baseStaged) {
     if (mode == RefreshMode::Fast) mode = _stagedMode;
@@ -1443,10 +1518,12 @@ bool It8951Driver::displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, R
 void It8951Driver::printTiming(const char* what, uint32_t t0Us, uint16_t dpyMode) {
   if (!Serial) return;
   const uint32_t totalUs = micros() - t0Us;
-  const uint32_t restUs = totalUs > _loadUs ? totalUs - _loadUs : 0;
-  Serial.printf("[it8951] %s: load %lu KB %lu ms (%s), mode %u refresh+wait %lu ms, total %lu ms\n", what,
-                (unsigned long)(_loadBytes / 1024), (unsigned long)(_loadUs / 1000), _memBitmap ? "1bpp" : "4bpp",
-                dpyMode, (unsigned long)(restUs / 1000), (unsigned long)(totalUs / 1000));
+  const uint32_t spentUs = _loadUs + _verifyUs;
+  const uint32_t restUs = totalUs > spentUs ? totalUs - spentUs : 0;
+  Serial.printf("[it8951] %s: load %lu KB %lu ms (%s), verify %lu ms, mode %u refresh+wait %lu ms, total %lu ms\n",
+                what, (unsigned long)(_loadBytes / 1024), (unsigned long)(_loadUs / 1000),
+                _memBitmap ? "1bpp" : "4bpp", (unsigned long)(_verifyUs / 1000), dpyMode,
+                (unsigned long)(restUs / 1000), (unsigned long)(totalUs / 1000));
 }
 #endif
 
@@ -1487,6 +1564,7 @@ void It8951Driver::repeatLastRefresh(EpdBus& bus) {
   const uint32_t tEntry = micros();
   _loadUs = 0;
   _loadBytes = 0;
+  _verifyUs = 0;
 #endif
   wakeController();
   waitDisplayReady();

@@ -102,6 +102,16 @@ struct It8951Config {
                                 // grayMode page is then the only drive the glass
                                 // got, the next B/W screen change is a clear
                                 // (fullMode) instead of fastMode.
+  uint16_t verifyLoadRows;      // read every Nth row of a 1bpp bitmap load back from
+                                // the frame memory (plus its first and last row) and
+                                // resend the load at spiHz, polled, if one differs:
+                                // a burst the controller dropped part of would
+                                // otherwise leave stale content on the glass until
+                                // the next clear. 0 (value-initialised) = no read-back.
+  uint8_t menuMode;             // waveform for a small B/W box (a menu highlight
+                                // move): faster than fastMode, e.g. A2. Its residue
+                                // joins the dirty region the next screen change
+                                // clears. 0 (value-initialised) = fastMode.
 };
 
 }  // namespace freeink
