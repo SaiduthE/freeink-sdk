@@ -1253,6 +1253,37 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   if (turnOff || _cfg.parkWhenIdle) park();
 }
 
+void It8951Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y,
+                                 uint16_t w, uint16_t h, bool turnOff) {
+  // The box is in framebuffer coordinates; DPY_AREA takes panel ones.
+  if (!fb || _rotation != 0 || _panelW != _fbW || _panelH != _fbH || w == 0 || h == 0 || x >= _fbW || y >= _fbH) {
+    display(bus, fb, prev, RefreshMode::Full, turnOff);
+    return;
+  }
+#ifdef IT8951_TIMING_LOG
+  const uint32_t tEntry = micros();
+  _loadUs = 0;
+  _loadBytes = 0;
+#endif
+  _baseStaged = false;
+  const uint16_t xEnd = static_cast<uint16_t>(x + w > _fbW ? _fbW : x + w);
+  const uint16_t y1 = static_cast<uint16_t>((y + h > _fbH ? _fbH : y + h) - 1);
+  const uint16_t x0 = static_cast<uint16_t>(x & ~7u);
+  // Full-width rows, as every partial load (see loadImageBand); only the box is driven.
+  loadImageBand(fb, y, y1);
+  displayArea(x0, y, static_cast<uint16_t>(xEnd - x0), static_cast<uint16_t>(y1 - y + 1), _cfg.fullMode);
+  waitDisplayReady();
+  // Memory now holds fb while the glass outside the box shows the older frame:
+  // the next display() reloads the whole frame and clears.
+  _memMirrorsBase = false;
+  _firstPaintPending = true;
+  _lastClear = false;
+#ifdef IT8951_TIMING_LOG
+  printTiming("displayWindow", tEntry, _cfg.fullMode);
+#endif
+  if (turnOff || _cfg.parkWhenIdle) park();
+}
+
 // Combined base: nothing goes to the panel here. Snapshot the B/W frame and the
 // refresh the host wanted for it; displayGray() folds the planes in and drives
 // the glass once. If there is no snapshot buffer, fall back to a plain display so
