@@ -207,7 +207,8 @@ void batteryIndicator(Frame<MaxInteractions>& frame, Rect rect,
       // Hand-drawn 5x8 bolt mask: at glyph-cavity sizes (~8 px) rasterized
       // triangles degenerate into a blob, so the shape is pixel-authored.
       // Drawn in the inverse color so it reads over both the filled and empty
-      // parts of the cavity.
+      // parts of the cavity. A taller cavity (larger UI scales) takes whole
+      // pixel multiples, filling ~80% of its height, so the bolt stays crisp.
       static constexpr uint8_t BOLT_5X8[] = {
           0x18,  // ...XX
           0x30,  // ..XX.
@@ -218,14 +219,32 @@ void batteryIndicator(Frame<MaxInteractions>& frame, Rect rect,
           0xC0,  // XX...
           0x80,  // X....
       };
-      BitmapRef boltMask;
-      boltMask.data = BOLT_5X8;
-      boltMask.width = 5;
-      boltMask.height = 8;
-      boltMask.format = BitmapFormat::BW1;  // set bit = ink
-      frame.target().bitmap(centeredRect(cavity, Size{5, 8}), boltMask,
-                            BitmapMode::Center,
-                            Paint::solid(invertedColor(props.color)));
+      const int16_t boltScale =
+          static_cast<int16_t>(cavity.height >= 10 ? (cavity.height * 4 / 5) / 8 : 1);
+      const Paint boltInk = Paint::solid(invertedColor(props.color));
+      if (boltScale <= 1) {
+        BitmapRef boltMask;
+        boltMask.data = BOLT_5X8;
+        boltMask.width = 5;
+        boltMask.height = 8;
+        boltMask.format = BitmapFormat::BW1;  // set bit = ink
+        frame.target().bitmap(centeredRect(cavity, Size{5, 8}), boltMask,
+                              BitmapMode::Center, boltInk);
+      } else {
+        const Rect bolt = centeredRect(
+            cavity, Size{static_cast<int16_t>(5 * boltScale),
+                         static_cast<int16_t>(8 * boltScale)});
+        for (int16_t row = 0; row < 8; ++row) {
+          for (int16_t col = 0; col < 5; ++col) {
+            if ((BOLT_5X8[row] & (0x80 >> col)) == 0) continue;
+            frame.target().fill(
+                Rect{static_cast<int16_t>(bolt.x + col * boltScale),
+                     static_cast<int16_t>(bolt.y + row * boltScale), boltScale,
+                     boltScale},
+                boltInk);
+          }
+        }
+      }
     }
   }
   if (props.label) {
