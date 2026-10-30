@@ -1509,6 +1509,85 @@ bool It8951Driver::displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, R
   return true;
 }
 
+// Rebuilt from the base/LSB/MSB planes, so a 16-level frame painted via displayGray4Buffer comes back as 4 levels.
+// The box of the page the planes hold, as 4bpp. Pixel for pixel what
+// loadImageGray() would have sent for the same planes: a set base bit is white
+// (0xF), else the LSB/MSB planes pick the level while _memHasGray says they are
+// real, else black. Nothing is read from the controller (its memory is lost in
+// deep sleep, and a readback would cost a burst anyway).
+bool It8951Driver::snapshotWindowGray4(int x, int y, int w, int h, uint8_t* out) {
+  // The planes must be what the glass shows: displayWindow() leaves memory ahead of them.
+  if (!out || !_base || _baseStaged || !_memMirrorsBase || _rotation != 0 || _panelW != _fbW || _panelH != _fbH) {
+    return false;
+  }
+  if (x < 0 || y < 0 || w <= 0 || h <= 0 || ((x | w) & 1) || x + w > _fbW || y + h > _fbH) return false;
+  const bool gray = _memHasGray && _gLsb && _gMsb;
+  const int rowBytes = w / 2;
+  for (int r = 0; r < h; r++) {
+    const uint32_t off = static_cast<uint32_t>(y + r) * _fbWb;
+    uint8_t* dst = out + static_cast<size_t>(r) * rowBytes;
+    for (int i = 0; i < rowBytes; i++) {
+      uint8_t v[2];
+      for (int k = 0; k < 2; k++) {
+        const int px = x + i * 2 + k;
+        const uint8_t mask = static_cast<uint8_t>(0x80 >> (px & 7));
+        const uint32_t o = off + (px >> 3);
+        v[k] = gray ? gray4(_base[o], _gLsb[o], _gMsb[o], mask) : ((_base[o] & mask) ? 0xF : 0x0);
+      }
+      dst[i] = static_cast<uint8_t>((v[0] << 4) | v[1]);
+    }
+  }
+  return true;
+}
+
+// A box from host rows, GC16 on the box alone -- displayWindow()'s refresh
+// with 16-level content. The load is full width like every partial load (see
+// loadImageBand: a non-zero x offset scattered on the bench); the pixels
+// outside [x, x + w) are white padding the refresh never shows. Levels over a
+// bitmap memory replace the whole frame, as in loadImageArea(). The memory
+// afterwards holds the box and old rows elsewhere, so the planes no longer
+// mirror it: the same post-state as displayWindow().
+bool It8951Driver::displayWindowGray4(EpdBus& bus, int x, int y, int w, int h, Gray4RowFill fill, void* ctx,
+                                      bool turnOff) {
+  (void)bus;
+  if (!fill || !_rowBuf || _rotation != 0 || _panelW != _fbW || _panelH != _fbH) return false;
+  if (x < 0 || y < 0 || w <= 0 || h <= 0 || ((x | w) & 1) || x + w > _fbW || y + h > _fbH) return false;
+  _baseStaged = false;
+  wakeController();
+  setTargetMemoryAddr(_imgBufAddr);
+  const int boxY = y;
+  int y0 = y;
+  int rows = h;
+  if (_memBitmap) {
+    y0 = 0;
+    rows = _fbH;
+  }
+  _memHasGray = false;
+  const uint16_t arg = static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_4 << 4) | (_rotation & 0x03));
+  writeCommand(CMD_LD_IMG_AREA);
+  writeData(arg);
+  writeData(0);  // x: full-width rows
+  writeData(static_cast<uint16_t>(y0));
+  writeData(_fbW);
+  writeData(static_cast<uint16_t>(rows));
+  const uint16_t rowBytes = static_cast<uint16_t>(_fbWb * 4);
+  streamImageRows(static_cast<uint16_t>(rows), rowBytes, [&](uint16_t i, uint8_t* rowBuf) {
+    memset(rowBuf, 0xFF, rowBytes);
+    const int r = y0 + i - boxY;
+    if (r >= 0 && r < h) fill(ctx, static_cast<uint16_t>(r), rowBuf + x / 2);
+  });
+  writeCommand(CMD_LD_IMG_END);
+  _memBitmap = false;
+  displayArea(static_cast<uint16_t>(x), static_cast<uint16_t>(y), static_cast<uint16_t>(w), static_cast<uint16_t>(h),
+              _cfg.fullMode);
+  waitDisplayReady();
+  _memMirrorsBase = false;
+  _firstPaintPending = true;
+  _lastClear = false;
+  if (turnOff || _cfg.parkWhenIdle) park();
+  return true;
+}
+
 #ifdef IT8951_TIMING_LOG
 // One line per refresh: the bytes pushed and how long the push took, the
 // waveform that ran and what the rest of the call cost (the refresh itself,
