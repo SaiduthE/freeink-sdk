@@ -295,6 +295,16 @@ class FreeInkDisplay {
   bool displayGray4Rows(Gray4RowFill fill, void* ctx, RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false,
                         bool updateFrameBuffer = false);
 
+  // A box of the 16-level page on its own (IT8951; see PanelDriver::
+  // snapshotWindowGray4 / displayWindowGray4). Framebuffer pixels, x and w
+  // even. snapshotWindowGray4() copies the box out of the driver's planes as
+  // packed 4bpp rows (w / 2 bytes each) into `out`; displayWindowGray4() loads
+  // the box from `fill` (row relative to the box, w / 2 bytes) and refreshes
+  // only it. Both are false and do nothing while output is inverted or where
+  // the driver cannot.
+  bool snapshotWindowGray4(int x, int y, int w, int h, uint8_t* out);
+  bool displayWindowGray4(int x, int y, int w, int h, Gray4RowFill fill, void* ctx, bool turnOffScreen = false);
+
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
 
   // The next begin() keeps what the glass shows instead of clearing it (on

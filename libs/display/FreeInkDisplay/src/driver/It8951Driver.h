@@ -86,6 +86,11 @@ class It8951Driver : public PanelDriver {
   bool supportsGray4() const override { return _rowBuf != nullptr; }
   bool displayGray4Rows(EpdBus& bus, Gray4RowFill fill, void* ctx, RefreshMode mode, bool turnOff,
                         uint8_t* baseOut) override;
+  // A box of the page: read back from the PSRAM planes, or loaded from rows and
+  // refreshed as GC16 alone (see PanelDriver). Both need rotation 0.
+  bool snapshotWindowGray4(int x, int y, int w, int h, uint8_t* out) override;
+  bool displayWindowGray4(EpdBus& bus, int x, int y, int w, int h, Gray4RowFill fill, void* ctx,
+                          bool turnOff) override;
 
  private:
   // --- low-level SPI framing ---

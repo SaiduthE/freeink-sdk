@@ -877,6 +877,24 @@ bool FreeInkDisplay::displayGray4Rows(Gray4RowFill fill, void* ctx, RefreshMode 
   return true;
 }
 
+bool FreeInkDisplay::snapshotWindowGray4(int x, int y, int w, int h, uint8_t* out) {
+  if (!supportsGray4()) return false;
+  syncPendingAsync();
+  return _driver->snapshotWindowGray4(x, y, w, h, out);
+}
+
+bool FreeInkDisplay::displayWindowGray4(int x, int y, int w, int h, Gray4RowFill fill, void* ctx, bool turnOffScreen) {
+  if (!fill || !supportsGray4()) return false;
+  cancelGrayscalePass();
+  _grayPassFailed = false;
+  syncPendingAsync();
+  if (!_driver->displayWindowGray4(_bus, x, y, w, h, fill, ctx, turnOffScreen)) return false;
+  _shadowValid = false;
+  _redRamSynced = false;
+  _inversionDirty = false;
+  return true;
+}
+
 void FreeInkDisplay::refreshDisplay(RefreshMode mode, bool turnOffScreen) { displayBuffer(mode, turnOffScreen); }
 
 void FreeInkDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) {

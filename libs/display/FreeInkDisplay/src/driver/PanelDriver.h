@@ -232,6 +232,37 @@ class PanelDriver {
     return false;
   }
 
+  // --- 16-level box on its own (IT8951) ---
+  // snapshotWindowGray4() reads the box (framebuffer pixels, x and w even) of
+  // the page the driver's memory mirrors back as packed 4bpp rows -- w / 2
+  // bytes each, left pixel in the high nibble, 0x0 black .. 0xF white -- into
+  // `out` (w / 2 * h bytes). False, `out` untouched, where the driver does not
+  // hold the page (a staged base, no planes, a rotated load, unsupported).
+  // displayWindowGray4() loads the box's rows from `fill` (Gray4RowFill: row
+  // is relative to the box, dst is w / 2 bytes) and refreshes just the box as
+  // GC16, leaving the glass outside it alone. False, fill never called, where
+  // unsupported or the box does not suit the load.
+  virtual bool snapshotWindowGray4(int x, int y, int w, int h, uint8_t* out) {
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    (void)out;
+    return false;
+  }
+  virtual bool displayWindowGray4(EpdBus& bus, int x, int y, int w, int h, Gray4RowFill fill, void* ctx,
+                                  bool turnOff) {
+    (void)bus;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    (void)fill;
+    (void)ctx;
+    (void)turnOff;
+    return false;
+  }
+
   // --- optional, controller-specific hooks (no-op by default) ---
   // The next begin() leaves the glass as it is (no clearing pass): the host
   // repaints over the retained frame with one clearing refresh.
